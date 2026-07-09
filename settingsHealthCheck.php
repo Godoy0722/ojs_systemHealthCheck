@@ -119,7 +119,7 @@ class SettingsHealthCheckTool extends CommandLineTool
             $entityMap = $registry->buildEntities();
 
             foreach ($registry->getWarnings() as $w) {
-                fwrite(STDERR, "[WARN] {$w}\n");
+                fwrite(STDERR, ReportWriter::color("[WARN]", 'bold|yellow') . " {$w}\n");
             }
 
             $gateway = new IlluminateDatabaseGateway();
@@ -131,7 +131,7 @@ class SettingsHealthCheckTool extends CommandLineTool
             $stats = $writer->computeStats($allFindings);
 
             foreach ($scanner->getWarnings() as $w) {
-                fwrite(STDERR, "[WARN] {$w}\n");
+                fwrite(STDERR, ReportWriter::color("[WARN]", 'bold|yellow') . " {$w}\n");
             }
 
             $context = $scanner->getContextStats();
@@ -157,14 +157,14 @@ class SettingsHealthCheckTool extends CommandLineTool
                 $fixer = new Fixer($gateway);
                 $fixResult = $fixer->fix($allFindings);
                 foreach ($fixer->getWarnings() as $w) {
-                    fwrite(STDERR, "[WARN] {$w}\n");
+                    fwrite(STDERR, ReportWriter::color("[WARN]", 'bold|yellow') . " {$w}\n");
                 }
                 echo $this->renderFixSummary($fixResult);
             }
 
             $exitCode = $stats > 0 ? 1 : 0;
         } catch (\Throwable $e) {
-            fwrite(STDERR, "[ERROR] {$e->getMessage()}\n");
+            fwrite(STDERR, ReportWriter::color("[ERROR]", 'bold|red') . " {$e->getMessage()}\n");
             $exitCode = 2;
         }
         exit($exitCode);
@@ -213,7 +213,7 @@ class SettingsHealthCheckTool extends CommandLineTool
                     $this->fix = true;
                     break;
                 default:
-                    fwrite(STDERR, "Unknown argument: {$arg}\n");
+                    fwrite(STDERR, ReportWriter::color("[ERROR]", 'bold|red') . " Unknown argument: {$arg}\n");
                     $this->usage();
                     exit(2);
             }
@@ -231,30 +231,30 @@ class SettingsHealthCheckTool extends CommandLineTool
     private function confirmReviewFix(int $count): void
     {
         echo "\n";
-        echo "================================================================================\n";
-        echo "WARNING: The scan found {$count} file(s) under the REVIEW_REVISION status.\n";
-        echo "Fixing these findings will permanently delete these files and their database records.\n";
-        echo "================================================================================\n\n";
+        echo ReportWriter::color("================================================================================\n", 'bold|red');
+        echo ReportWriter::color("WARNING: The scan found {$count} file(s) under the REVIEW_REVISION status.\n", 'bold|red');
+        echo ReportWriter::color("Fixing these findings will permanently delete these files and their database records.\n", 'bold|red');
+        echo ReportWriter::color("================================================================================\n\n", 'bold|red');
 
         echo "Stage 1/3: Are you aware that this operation will delete data in the database? (yes/no): ";
         if (strtolower(trim(fgets(STDIN))) !== 'yes') {
-            echo "Aborted: User did not confirm awareness of database deletion.\n";
+            echo ReportWriter::color("Aborted: User did not confirm awareness of database deletion.\n", 'yellow');
             exit(1);
         }
 
         echo "Stage 2/3: Do you really want to execute this operation in the database? This is your second confirmation. (yes/no): ";
         if (strtolower(trim(fgets(STDIN))) !== 'yes') {
-            echo "Aborted: User did not provide the second confirmation.\n";
+            echo ReportWriter::color("Aborted: User did not provide the second confirmation.\n", 'yellow');
             exit(1);
         }
 
         echo "Stage 3/3: This is the final confirmation. This will permanently delete files and database records. Confirm by typing 'DELETE': ";
         if (trim(fgets(STDIN)) !== 'DELETE') {
-            echo "Aborted: Final confirmation mismatch.\n";
+            echo ReportWriter::color("Aborted: Final confirmation mismatch.\n", 'yellow');
             exit(1);
         }
 
-        echo "\nConfirmation successful. Moving forward with the execution...\n\n";
+        echo ReportWriter::color("\nConfirmation successful. Moving forward with the execution...\n\n", 'green');
     }
 
     /**
@@ -264,16 +264,18 @@ class SettingsHealthCheckTool extends CommandLineTool
      */
     private function renderFixSummary(array $r): string
     {
+        $c = fn(string $t, string $clr) => ReportWriter::color($t, $clr);
+
         $lines = [];
         $lines[] = '';
-        $lines[] = '  Fixes applied';
-        $lines[] = '  -------------';
-        $lines[] = sprintf('  Orphaned rows deleted : %d', $r['orphansDeleted']);
-        $lines[] = sprintf('  Missing locales set   : %d', $r['localesFixed']);
-        $lines[] = sprintf('  Review files deleted  : %d', $r['reviewFilesDeleted']);
-        $lines[] = sprintf('  Empty fields skipped  : %d  (no auto-fix yet)', $r['skipped']);
+        $lines[] = '  ' . $c('Fixes applied', 'bold');
+        $lines[] = '  ' . $c('-------------', 'bold');
+        $lines[] = sprintf('  Orphaned rows deleted : %s', $c((string) $r['orphansDeleted'], 'green'));
+        $lines[] = sprintf('  Missing locales set   : %s', $c((string) $r['localesFixed'], 'green'));
+        $lines[] = sprintf('  Review files deleted  : %s', $c((string) $r['reviewFilesDeleted'], 'green'));
+        $lines[] = sprintf('  Empty fields skipped  : %s  (no auto-fix yet)', $c((string) $r['skipped'], 'yellow'));
         if ($r['failed'] > 0) {
-            $lines[] = sprintf('  Failed                : %d  (see warnings above)', $r['failed']);
+            $lines[] = sprintf('  Failed                : %s  (see warnings above)', $c((string) $r['failed'], 'red'));
         }
         return implode("\n", $lines) . "\n";
     }

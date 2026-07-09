@@ -16,6 +16,51 @@ namespace APP\tools\settingsHealthCheck\src;
 
 final class ReportWriter
 {
+    // ── ANSI terminal colors ──────────────────────────────────────────────
+
+    private const C_RESET  = "\033[0m";
+    private const C_BOLD   = "\033[1m";
+    private const C_DIM    = "\033[2m";
+    private const C_RED    = "\033[31m";
+    private const C_GREEN  = "\033[32m";
+    private const C_YELLOW = "\033[33m";
+    private const C_CYAN   = "\033[36m";
+
+    /**
+     * Wrap $text in ANSI color codes. Multiple colors can be combined by
+     * separating them with a pipe, e.g. "bold|red". Pass an empty string as
+     * $color to skip wrapping (returns $text unchanged).
+     */
+    private static ?bool $supportsColor = null;
+
+    public static function color(string $text, string $color): string
+    {
+        if ($color === '' || !self::supportsColor()) {
+            return $text;
+        }
+        $codes = [];
+        foreach (explode('|', $color) as $c) {
+            $const = 'self::C_' . strtoupper($c);
+            if (defined($const)) {
+                $codes[] = constant($const);
+            }
+        }
+        if (empty($codes)) {
+            return $text;
+        }
+        return implode('', $codes) . $text . self::C_RESET;
+    }
+
+    private static function supportsColor(): bool
+    {
+        if (self::$supportsColor !== null) {
+            return self::$supportsColor;
+        }
+        self::$supportsColor = function_exists('stream_isatty') && stream_isatty(STDOUT)
+            && getenv('NO_COLOR') === false;
+        return self::$supportsColor;
+    }
+
     /**
      * Returns the total number of findings. Formerly also computed per-table
      * breakdowns; now a thin count wrapper kept as its own method so the
@@ -42,7 +87,7 @@ final class ReportWriter
     {
         $findings = $context['findings'] ?? [];
         if (empty($findings)) {
-            return "\n  No findings.\n";
+            return "\n  " . self::color('No findings.', 'green') . "\n";
         }
 
         $cap = (int) ($context['detailCap'] ?? 50);
@@ -64,11 +109,13 @@ final class ReportWriter
      */
     private function renderFindingsDetail(array $findings, int $cap, array $tableResults = []): array
     {
+        $c = fn(string $t, string $clr) => self::color($t, $clr);
+
         $lines = [];
         $lines[] = '';
-        $lines[] = self::RULE_SINGLE;
-        $lines[] = '  Detailed findings (' . count($findings) . ')';
-        $lines[] = self::RULE_SINGLE;
+        $lines[] = $c(self::RULE_SINGLE, 'bold|cyan');
+        $lines[] = '  ' . $c('Detailed findings (' . count($findings) . ')', 'bold');
+        $lines[] = $c(self::RULE_SINGLE, 'bold|cyan');
 
         $byTable = [];
         foreach ($findings as $f) {
@@ -79,7 +126,7 @@ final class ReportWriter
         $shown = 0;
         foreach ($byTable as $table => $rows) {
             $lines[] = '';
-            $lines[] = '  Table: ' . $table . '   (' . count($rows) . ' issue' . (count($rows) === 1 ? '' : 's') . ')';
+            $lines[] = '  ' . $c('Table: ' . $table, 'bold') . '   (' . count($rows) . ' issue' . (count($rows) === 1 ? '' : 's') . ')';
             $fkInfo = $this->parseFk($tableResults[$table]['orphanFk'] ?? null);
             $entityLabel = $fkInfo['column'] ?? 'entity_id';
             $parentTable = $fkInfo['parentTable'] ?? null;
@@ -90,18 +137,18 @@ final class ReportWriter
                 }
                 $entity = $f->entityId === null ? '(unknown)' : (string) $f->entityId;
                 $lines[] = sprintf('    Row #%s  (%s = %s)', (string) $f->pk, $entityLabel, $entity);
-                $lines[] = '      Problem : ' . $this->describeReason($f, $parentTable);
+                $lines[] = '      ' . $c('Problem', 'red') . ' : ' . $this->describeReason($f, $parentTable);
                 if ($f->reason === Finding::REASON_REQUIRED_NULL) {
-                    $lines[] = '      Column  : ' . $f->settingName . '  (declared required, currently NULL)';
+                    $lines[] = '      ' . $c('Column', 'cyan') . '  : ' . $f->settingName . '  (declared required, currently NULL)';
                 } elseif ($f->settingName !== '') {
                     $localeLabel = ($f->locale === null || $f->locale === '') ? 'no locale tag' : 'locale "' . $f->locale . '"';
-                    $lines[] = '      Field   : ' . $f->settingName . '  (' . $localeLabel . ')';
+                    $lines[] = '      ' . $c('Field', 'cyan') . '   : ' . $f->settingName . '  (' . $localeLabel . ')';
                 }
                 if ($f->valuePreview !== '') {
-                    $lines[] = '      Value   : ' . $this->truncate($f->valuePreview, 100);
+                    $lines[] = '      ' . $c('Value', 'dim') . '   : ' . $this->truncate($f->valuePreview, 100);
                 }
                 if ($f->suggestedLocale !== '') {
-                    $lines[] = '      Suggest : tag this row with locale "' . $f->suggestedLocale . '"';
+                    $lines[] = '      ' . $c('Suggest', 'green') . ' : tag this row with locale "' . $f->suggestedLocale . '"';
                 }
                 $shown++;
             }
