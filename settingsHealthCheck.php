@@ -13,7 +13,7 @@
  *
  * @brief CLI diagnostic that scans every *_settings table for rows storing a
  *        multilingual field with an empty/null locale (PHP 8 hydration breaker).
- *        Read-only by default (writes CSV report and stdout summary); with
+ *        Read-only by default (prints stdout summary); with
  *        --fix it also applies basic remediations to the database.
  *        See REPORT.md for the host05/ajis.aaisnet.org incident that motivated this.
  *
@@ -106,8 +106,7 @@ class SettingsHealthCheckTool extends CommandLineTool
             Usage: php tools/settingsHealthCheck.php <check>
 
             Read-only diagnostic over every *_settings table. Pick one or more checks;
-            running with no check shows this message. Writes a CSV report to the files
-            directory and prints a summary to stdout.
+            running with no check shows this message. Prints a summary to stdout.
 
             Checks:
             -o, --orphan    Only orphaned settings (parent entity no longer exists)
@@ -150,19 +149,15 @@ class SettingsHealthCheckTool extends CommandLineTool
             $scanner = new Scanner($gateway);
             $writer = new ReportWriter();
 
-            $csvPath = $this->defaultCsvPath();
-            $this->ensureWritable($csvPath);
-
             $scanner->initialize($schemaMap, $entityMap);
             $allFindings = $scanner->scan($this->checks);
-            $stats = $writer->writeCsv($csvPath, $allFindings);
+            $stats = $writer->computeStats($allFindings);
 
             foreach ($scanner->getWarnings() as $w) {
                 fwrite(STDERR, "[WARN] {$w}\n");
             }
 
             $context = $scanner->getContextStats();
-            $context['csvPath'] = $csvPath;
             $context['checks'] = $this->checks;
             $context['tableResults'] = $scanner->getTableResults();
             $context['entityResults'] = $scanner->getEntityResults();
@@ -249,22 +244,6 @@ class SettingsHealthCheckTool extends CommandLineTool
         return implode("\n", $lines) . "\n";
     }
 
-    private function defaultCsvPath(): string
-    {
-        $filesDir = Config::getVar('files', 'files_dir') ?: sys_get_temp_dir();
-        return rtrim($filesDir, '/') . '/settings-health-check-' . date('Y-m-d-His') . '.csv';
-    }
-
-    private function ensureWritable(string $path): void
-    {
-        $dir = dirname($path);
-        if (!is_dir($dir) && !mkdir($dir, 0777, true) && !is_dir($dir)) {
-            throw new \RuntimeException('Cannot create CSV directory: ' . $dir);
-        }
-        if (!is_writable($dir)) {
-            throw new \RuntimeException('CSV directory not writable: ' . $dir);
-        }
-    }
 }
 
 $tool = new SettingsHealthCheckTool(isset($argv) ? $argv : []);

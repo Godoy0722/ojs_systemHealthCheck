@@ -9,29 +9,18 @@
  *
  * @class ReportWriter
  *
- * @brief Streams findings into a CSV file (one pass) and renders the stdout summary.
+ * @brief Computes finding statistics and renders the stdout summary.
  */
 
 namespace APP\tools\settingsHealthCheck\src;
 
 final class ReportWriter
 {
-    public const HEADER = [
-        'table',
-        'pk',
-        'entity_id',
-        'setting_name',
-        'locale',
-        'value_preview',
-        'reason',
-        'suggested_locale',
-    ];
-
     /**
      * @param iterable<Finding> $findings
      * @return array{rows:int,byTable:array<string,int>,settingsByTable:array<string,array<string,true>>,reasonsByTable:array<string,array<string,int>>}
      */
-    public function writeCsv(string $path, iterable $findings): array
+    public function computeStats(iterable $findings): array
     {
         $stats = [
             'rows' => 0,
@@ -40,32 +29,12 @@ final class ReportWriter
             'reasonsByTable' => [],
         ];
 
-        $fp = fopen($path, 'w');
-        if ($fp === false) {
-            throw new \RuntimeException('Cannot open CSV for writing: ' . $path);
-        }
-        try {
-            fputcsv($fp, self::HEADER, ',', '"', '\\');
-            foreach ($findings as $f) {
-                fputcsv($fp, [
-                    $f->table,
-                    (string) $f->pk,
-                    $f->entityId === null ? '' : (string) $f->entityId,
-                    $f->settingName,
-                    $f->locale ?? '',
-                    $f->valuePreview,
-                    $f->reason,
-                    $f->suggestedLocale,
-                ], ',', '"', '\\');
-
-                $stats['rows']++;
-                $stats['byTable'][$f->table] = ($stats['byTable'][$f->table] ?? 0) + 1;
-                $stats['settingsByTable'][$f->table][$f->settingName] = true;
-                $stats['reasonsByTable'][$f->table][$f->reason]
-                    = ($stats['reasonsByTable'][$f->table][$f->reason] ?? 0) + 1;
-            }
-        } finally {
-            fclose($fp);
+        foreach ($findings as $f) {
+            $stats['rows']++;
+            $stats['byTable'][$f->table] = ($stats['byTable'][$f->table] ?? 0) + 1;
+            $stats['settingsByTable'][$f->table][$f->settingName] = true;
+            $stats['reasonsByTable'][$f->table][$f->reason]
+                = ($stats['reasonsByTable'][$f->table][$f->reason] ?? 0) + 1;
         }
 
         return $stats;
@@ -77,7 +46,7 @@ final class ReportWriter
      * Renders only the detailed-findings section. Returns a short notice when
      * the scan turned up nothing.
      *
-     * @param array{csvPath?:string,detailCap?:int,findings?:Finding[],tableResults?:array<string,array{orphanFk?:?string}>} $context
+     * @param array{detailCap?:int,findings?:Finding[],tableResults?:array<string,array{orphanFk?:?string}>} $context
      */
     public function renderSummary(array $context): string
     {
@@ -88,7 +57,7 @@ final class ReportWriter
 
         $cap = (int) ($context['detailCap'] ?? 50);
         $tableResults = $context['tableResults'] ?? [];
-        $lines = $this->renderFindingsDetail($findings, $cap, $context['csvPath'] ?? '', $tableResults);
+        $lines = $this->renderFindingsDetail($findings, $cap, $tableResults);
 
         return implode("\n", $lines) . "\n";
     }
@@ -98,7 +67,7 @@ final class ReportWriter
      * @param array<string, array{kind:string,settingsChecked:string[],findingsCount:int,status:string,note:string,orphanFk?:?string}> $tableResults
      * @return string[]
      */
-    private function renderFindingsDetail(array $findings, int $cap, string $csvPath, array $tableResults = []): array
+    private function renderFindingsDetail(array $findings, int $cap, array $tableResults = []): array
     {
         $lines = [];
         $lines[] = '';
@@ -146,11 +115,7 @@ final class ReportWriter
         $remaining = count($findings) - $shown;
         if ($remaining > 0) {
             $lines[] = '';
-            $tail = '  ... and ' . $remaining . ' more issue' . ($remaining === 1 ? '' : 's');
-            if ($csvPath !== '') {
-                $tail .= ' (full list in CSV: ' . $csvPath . ')';
-            }
-            $lines[] = $tail;
+            $lines[] = '  ... and ' . $remaining . ' more issue' . ($remaining === 1 ? '' : 's');
         }
 
         return $lines;
