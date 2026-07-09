@@ -17,36 +17,26 @@ namespace APP\tools\settingsHealthCheck\src;
 final class ReportWriter
 {
     /**
-     * @param iterable<Finding> $findings
-     * @return array{rows:int,byTable:array<string,int>,settingsByTable:array<string,array<string,true>>,reasonsByTable:array<string,array<string,int>>}
+     * Returns the total number of findings. Formerly also computed per-table
+     * breakdowns; now a thin count wrapper kept as its own method so the
+     * call site doesn't couple to count() semantics.
+     *
+     * @param Finding[] $findings
+     * @return int
      */
-    public function computeStats(iterable $findings): array
+    public function computeStats(array $findings): int
     {
-        $stats = [
-            'rows' => 0,
-            'byTable' => [],
-            'settingsByTable' => [],
-            'reasonsByTable' => [],
-        ];
-
-        foreach ($findings as $f) {
-            $stats['rows']++;
-            $stats['byTable'][$f->table] = ($stats['byTable'][$f->table] ?? 0) + 1;
-            $stats['settingsByTable'][$f->table][$f->settingName] = true;
-            $stats['reasonsByTable'][$f->table][$f->reason]
-                = ($stats['reasonsByTable'][$f->table][$f->reason] ?? 0) + 1;
-        }
-
-        return $stats;
+        return count($findings);
     }
 
     private const RULE_SINGLE = '────────────────────────────────────────────────────────────────────────────────';
 
     /**
-     * Renders only the detailed-findings section. Returns a short notice when
-     * the scan turned up nothing.
+     * Renders the full stdout report: a detailed-findings section grouped by
+     * table, or a short "No findings." notice when the scan turned up nothing.
      *
      * @param array{detailCap?:int,findings?:Finding[],tableResults?:array<string,array{orphanFk?:?string}>} $context
+     * @return string
      */
     public function renderSummary(array $context): string
     {
@@ -63,7 +53,12 @@ final class ReportWriter
     }
 
     /**
+     * Builds the detailed-findings block: one sub-section per table, each
+     * row annotated with reason, value preview, and suggested fix. Caps
+     * output at $cap rows to avoid flooding the terminal.
+     *
      * @param Finding[] $findings
+     * @param int $cap Maximum rows to render before truncating
      * @param array<string, array{kind:string,settingsChecked:string[],findingsCount:int,status:string,note:string,orphanFk?:?string}> $tableResults
      * @return string[]
      */
@@ -122,6 +117,10 @@ final class ReportWriter
     }
 
     /**
+     * Parses a foreign-key descriptor string produced by the orphan pass
+     * (format: "user_id -> users(user_id)") into its three parts.
+     *
+     * @param string|null $fk FK descriptor or null when no FK was resolved
      * @return array{column:?string,parentTable:?string,parentColumn:?string}
      */
     private function parseFk(?string $fk): array
@@ -136,6 +135,13 @@ final class ReportWriter
         return ['column' => null, 'parentTable' => null, 'parentColumn' => null];
     }
 
+    /**
+     * Returns a human-readable explanation for a finding's reason code.
+     *
+     * @param Finding $f The finding to describe
+     * @param string|null $parentTable Parent table name (for orphan context)
+     * @return string
+     */
     private function describeReason(Finding $f, ?string $parentTable): string
     {
         switch ($f->reason) {
@@ -157,6 +163,14 @@ final class ReportWriter
         }
     }
 
+    /**
+     * Truncates a string to $max characters, appending "..." when trimmed.
+     * Uses mb_* functions for safe multi-byte handling.
+     *
+     * @param string $s
+     * @param int $max
+     * @return string
+     */
     private function truncate(string $s, int $max): string
     {
         if (mb_strlen($s) <= $max) {

@@ -23,7 +23,7 @@ final class Finding
     public const REASON_SETTING_VALUE_NULL = 'setting_value_null';
     public const REASON_REVIEW_REVISION = 'review_revision';
 
-    public const VALUE_PREVIEW_MAX = 80;
+    private const VALUE_PREVIEW_MAX = 80;
 
     /** @var string */
     public $table;
@@ -43,34 +43,18 @@ final class Finding
     public $suggestedLocale;
 
     /**
-     * @param int|string $pk
-     * @param int|string|null $entityId
+     * One flagged row from a *_settings table. Raw values are truncated to
+     * VALUE_PREVIEW_MAX for display.
+     *
+     * @param int|string $pk Primary-key value of the offending row
+     * @param int|string|null $entityId Parent entity id (FK column value)
+     * @param string $settingName Name of the affected setting
+     * @param string|null $locale Locale tag (null or empty = missing)
+     * @param string|null $rawValue Raw setting_value from DB (may be null)
+     * @param string $reason One of the REASON_* constants
+     * @param string $suggestedLocale Locale to fix with, or '' when not applicable
      */
     public function __construct(
-        string $table,
-        $pk,
-        $entityId,
-        string $settingName,
-        ?string $locale,
-        string $valuePreview,
-        string $reason,
-        string $suggestedLocale
-    ) {
-        $this->table = $table;
-        $this->pk = $pk;
-        $this->entityId = $entityId;
-        $this->settingName = $settingName;
-        $this->locale = $locale;
-        $this->valuePreview = $valuePreview;
-        $this->reason = $reason;
-        $this->suggestedLocale = $suggestedLocale;
-    }
-
-    /**
-     * @param int|string $pk
-     * @param int|string|null $entityId
-     */
-    public static function fromRow(
         string $table,
         $pk,
         $entityId,
@@ -79,20 +63,17 @@ final class Finding
         ?string $rawValue,
         string $reason,
         string $suggestedLocale
-    ): self {
+    ) {
+        $this->table = $table;
+        $this->pk = $pk;
+        $this->entityId = $entityId;
+        $this->settingName = $settingName;
+        $this->locale = $locale;
         $value = (string) ($rawValue ?? '');
-        if (strlen($value) > self::VALUE_PREVIEW_MAX) {
-            $value = substr($value, 0, self::VALUE_PREVIEW_MAX);
-        }
-        return new self(
-            $table,
-            $pk,
-            $entityId,
-            $settingName,
-            $locale,
-            $value,
-            $reason,
-            $suggestedLocale
-        );
+        $this->valuePreview = (strlen($value) > self::VALUE_PREVIEW_MAX)
+            ? substr($value, 0, self::VALUE_PREVIEW_MAX)
+            : $value;
+        $this->reason = $reason;
+        $this->suggestedLocale = $suggestedLocale;
     }
 }

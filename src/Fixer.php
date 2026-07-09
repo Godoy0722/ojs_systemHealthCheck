@@ -24,7 +24,7 @@ namespace APP\tools\settingsHealthCheck\src;
 
 final class Fixer
 {
-    /** @var DatabaseGateway */
+    /** @var IlluminateDatabaseGateway */
     private $gateway;
 
     /** @var string Locale stamped onto missing-locale rows that carry no suggestion. */
@@ -33,7 +33,10 @@ final class Fixer
     /** @var string[] */
     private array $warnings = [];
 
-    public function __construct(DatabaseGateway $gateway)
+    /**
+     * @brief Resolves the site primary locale once so every fix uses the same fallback.
+     */
+    public function __construct(IlluminateDatabaseGateway $gateway)
     {
         $this->gateway = $gateway;
         $locale = $gateway->getSitePrimaryLocale();
@@ -41,8 +44,14 @@ final class Fixer
     }
 
     /**
+     * Applies remediations to every finding. Orphaned rows are deleted,
+     * missing-locale rows are stamped with the default locale, review-revision
+     * files are cascade-deleted. Empty-field findings are skipped (no safe
+     * automatic fix). Each row is independent — a failure on one does not abort
+     * the rest.
+     *
      * @param Finding[] $findings
-     * @return array{orphansDeleted:int, localesFixed:int, skipped:int, failed:int}
+     * @return array{orphansDeleted:int, localesFixed:int, reviewFilesDeleted:int, skipped:int, failed:int}
      */
     public function fix(array $findings): array
     {
@@ -106,6 +115,9 @@ final class Fixer
     }
 
     /**
+     * Non-fatal errors collected during the fix pass (e.g. one row that
+     * couldn't be updated).
+     *
      * @return string[]
      */
     public function getWarnings(): array

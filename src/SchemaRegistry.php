@@ -9,19 +9,16 @@
  *
  * @class SchemaRegistry
  *
- * @brief Loads pkp-lib + app entity schemas and produces a map
- *        { settingsTable => { multilingualSettingName => true } }
- *        used by the schema-driven detection pass.
+ * @brief Loads pkp-lib + app entity schemas and produces two maps:
+ *        { settingsTable => { multilingualSettingName => true } } used by
+ *        the schema-driven locale pass, and { mainTable => { table, pk,
+ *        requiredColumns } } used by the required-null pass.
  */
 
 namespace APP\tools\settingsHealthCheck\src;
 
 final class SchemaRegistry
 {
-    /**
-     * Default schema-name -> settings-table mapping for OJS core entities.
-     * Verified against lib/pkp/classes/migration/install/*.php and OJS schemas/.
-     */
     /**
      * Entity schema name -> [main table, primary key column].
      * Used by Pass D (required-but-null detection on main entity rows).
@@ -42,6 +39,10 @@ final class SchemaRegistry
         'userGroup'         => ['user_groups', 'user_group_id'],
     ];
 
+    /**
+     * Entity schema name -> settings table name.
+     * Verified against lib/pkp/classes/migration/install/*.php and OJS schemas/.
+     */
     public const DEFAULT_SCHEMA_TABLE_MAP = [
         'announcement' => 'announcement_settings',
         'author' => 'author_settings',
@@ -79,9 +80,12 @@ final class SchemaRegistry
     /** @var array<string, array{table:string, pk:string, requiredColumns:string[]}> */
     private array $entityMap = [];
 
+    /** @var bool Idempotency guard — build() runs only once. */
     private bool $built = false;
 
     /**
+     * @param string $pkpSchemaDir Path to lib/pkp/schemas/
+     * @param string $appSchemaDir Path to schemas/ (app overrides)
      * @param array<string, string> $schemaTableMap schema name => settings table name
      * @param array<string, array{0:string,1:string}> $entityTableMap schema name => [main table, pk]
      */
@@ -98,6 +102,11 @@ final class SchemaRegistry
     }
 
     /**
+     * Scans both schema directories, extracts multilingual property names
+     * and required columns from each entity JSON file, and returns the
+     * { settingsTable => { multilingualSettingName => true } } map.
+     * Idempotent — subsequent calls return the cached result.
+     *
      * @return array<string, array<string, true>>
      */
     public function build(): array
@@ -149,6 +158,9 @@ final class SchemaRegistry
     }
 
     /**
+     * Warnings collected during build (missing schema files, JSON parse
+     * errors, unmapped multilingual schemas).
+     *
      * @return string[]
      */
     public function getWarnings(): array
@@ -157,14 +169,9 @@ final class SchemaRegistry
     }
 
     /**
-     * @return string[]
-     */
-    public function getMappedTables(): array
-    {
-        return array_keys($this->map);
-    }
-
-    /**
+     * Returns the entity map built alongside the multilingual map. Ensures
+     * build() has run before returning so the map is always populated.
+     *
      * @return array<string, array{table:string, pk:string, requiredColumns:string[]}>
      */
     public function buildEntities(): array
@@ -176,11 +183,11 @@ final class SchemaRegistry
     }
 
     /**
-     * Extract names of properties marked required (validation contains "required"
-     * OR a top-level 'required' array exists at schema root). Multilingual props
-     * are skipped (settings-table responsibility, not main-row).
+     * Extracts property names whose validation rules include "required".
+     * Multilingual properties are skipped — they live in *_settings tables,
+     * not on the main entity row.
      *
-     * @param array<string, array<string, mixed>> $properties
+     * @param array<string, array<string, mixed>> $properties Decoded JSON properties object
      * @return string[] DB column names (snake_case)
      */
     private function extractRequiredColumns(array $properties): array
@@ -213,13 +220,23 @@ final class SchemaRegistry
         return $out;
     }
 
+    /**
+     * Converts a camelCase JSON property name to its snake_case DB column
+     * equivalent (e.g. "contactEmail" → "contact_email").
+     *
+     * @param string $s camelCase input
+     * @return string snake_case output
+     */
     private function camelToSnake(string $s): string
     {
         return strtolower((string) preg_replace('/(?<!^)([A-Z])/', '_$1', $s));
     }
 
     /**
-     * @return string[] Schema names found in either dir.
+     * Enumerates all .json filenames (without extension) found in either
+     * the pkp-lib or app schema directory.
+     *
+     * @return string[] Unique schema names
      */
     private function discoverSchemaNames(): array
     {
@@ -233,7 +250,11 @@ final class SchemaRegistry
     }
 
     /**
-     * @return array<string, array<string, mixed>>|null Merged properties (app over pkp) or null on parse failure.
+     * Loads and merges the "properties" objects from the pkp-lib and app
+     * copies of a schema, with the app copy taking precedence.
+     *
+     * @param string $name Schema name without extension
+     * @return array<string, array<string, mixed>>|null Merged properties, or null on parse failure
      */
     private function loadMergedProperties(string $name): ?array
     {
@@ -248,7 +269,10 @@ final class SchemaRegistry
     }
 
     /**
-     * @return array<string, mixed>|false|null array on success, null if file absent, false on parse failure.
+     * Reads and decodes a single JSON schema file.
+     *
+     * @param string $path Absolute path to a .json file
+     * @return array<string, mixed>|false|null array on success, null if file absent, false on parse failure
      */
     private function parseSchemaFile(string $path)
     {
@@ -269,8 +293,11 @@ final class SchemaRegistry
     }
 
     /**
-     * @param array<string, array<string, mixed>> $properties
-     * @return array<string, true>
+     * Extracts property names whose schema definition includes a truthy
+     * "multilingual" flag.
+     *
+     * @param array<string, array<string, mixed>> $properties Decoded JSON properties object
+     * @return array<string, true> Set of multilingual property names
      */
     private function extractMultilingual(array $properties): array
     {

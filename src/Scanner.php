@@ -9,10 +9,10 @@
  *
  * @class Scanner
  *
- * @brief Runs the two detection passes over a database via DatabaseGateway.
- *        Eager: scan() executes synchronously and returns Finding[]. tableResults
- *        and contextStats are guaranteed populated after scan() returns regardless
- *        of how the caller iterates the results.
+ * @brief Runs the detection passes (A–E) over a database via the gateway.
+ *        Eager: scan() executes synchronously and returns Finding[].
+ *        tableResults and contextStats are guaranteed populated after scan()
+ *        returns regardless of how the caller iterates the results.
  */
 
 namespace APP\tools\settingsHealthCheck\src;
@@ -63,17 +63,22 @@ final class Scanner
     /** @var Finding[] */
     private array $findings = [];
 
-    /** @var DatabaseGateway */
+    /** @var IlluminateDatabaseGateway */
     private $gateway;
 
-    public function __construct(DatabaseGateway $gateway)
+    /**
+     * @brief Wires the database gateway used by all detection passes.
+     */
+    public function __construct(IlluminateDatabaseGateway $gateway)
     {
         $this->gateway = $gateway;
     }
 
     /**
-     * Resolves database name, primary locale, auto-discovered tables, and
-     * pre-populates per-table results with status='pending'.
+     * Resolves database name, primary locale, and auto-discovered tables.
+     * Pre-populates per-table results with status='pending' so every known
+     * table has a result slot before any pass runs. Must be called once
+     * before scan().
      *
      * @param array<string, array<string, true>> $schemaMap table => set of multilingual setting_name
      * @param array<string, array{table:string,pk:string,requiredColumns:string[]}> $entityMap mainTable => meta
@@ -120,12 +125,11 @@ final class Scanner
     }
 
     /**
-     * Synchronously runs the requested check passes. Returns the collected
-     * Finding array. After return, getTableResults() and getContextStats()
-     * are fully populated.
+     * Synchronously runs the requested check passes and returns every
+     * Finding collected. After return, getTableResults(), getContextStats(),
+     * and getEntityResults() are fully populated.
      *
-     * @param string[]|null $checks Subset of CHECK_* constants to run. Null
-     *        runs every check (the historical full-scan behaviour).
+     * @param string[]|null $checks Subset of CHECK_* constants. Null runs every check.
      * @return Finding[]
      */
     public function scan(?array $checks = null): array
@@ -149,7 +153,7 @@ final class Scanner
             try {
                 foreach ($this->gateway->getMultilingualOffenders($table, $names) as $row) {
                     $count++;
-                    $this->findings[] = Finding::fromRow(
+                    $this->findings[] = new Finding(
                         $table,
                         $row['pk'],
                         $row['fk'] ?? null,
@@ -192,7 +196,7 @@ final class Scanner
                 if (!empty($suspects)) {
                     foreach ($this->gateway->getEmptyLocaleRowsForSettings($table, $suspects) as $row) {
                         $count++;
-                        $this->findings[] = Finding::fromRow(
+                        $this->findings[] = new Finding(
                             $table,
                             $row['pk'],
                             $row['fk'] ?? null,
@@ -231,7 +235,7 @@ final class Scanner
 
         // Pass C — orphan FK detection across every known settings table.
         if (!empty($run[self::CHECK_ORPHAN])) {
-            foreach ($this->tableResults as $table => $r) {
+            foreach ($this->tableResults as $table => $_r) {
                 $this->runOrphanPass($table);
             }
         }
@@ -261,10 +265,10 @@ final class Scanner
      * Resolves leftover per-table state after a partial scan so the report
      * never claims a dimension was checked when its pass was skipped:
      *  - skipped locale pass: clear settingsChecked, note that it was not run;
-     *  - skipped orphan pass: mark the orphan sub-status 'skipped' (no line);
+     *  - skipped orphan pass: mark the orphan sub-status 'skipped';
      *  - any still-'pending' status collapses to 'clean'.
      *
-     * @param array<string, true> $run
+     * @param array<string, true> $run Map of check constants that actually ran
      */
     private function finalizeTableResults(array $run): void
     {
@@ -292,7 +296,12 @@ final class Scanner
     }
 
     /**
-     * @param array{table:string,pk:string,requiredColumns:string[]} $entity
+     * Pass D1 — scans main entity tables for schema-required columns that
+     * are declared nullable in the database and contain NULL rows. Flags
+     * each such row as a REQUIRED_NULL finding.
+     *
+     * @param string $mainTable The entity's canonical table (e.g. "journals")
+     * @param array{table:string,pk:string,requiredColumns:string[]} $entity Entity metadata from the schema registry
      */
     private function runRequiredNullPass(string $mainTable, array $entity): void
     {
@@ -307,7 +316,7 @@ final class Scanner
             foreach ($nullableRequired as $column) {
                 foreach ($this->gateway->findRowsWithNullColumn($mainTable, $pk, $column) as $row) {
                     $count++;
-                    $this->findings[] = Finding::fromRow(
+                    $this->findings[] = new Finding(
                         $mainTable,
                         $row['pk'],
                         $row['pk'],
@@ -340,6 +349,12 @@ final class Scanner
         ];
     }
 
+    /**
+     * Pass D2 — scans every known *_settings table for rows where
+     * setting_value IS NULL. Flags each as a SETTING_VALUE_NULL finding.
+     *
+     * @param string $table A *_settings table name
+     */
     private function runSettingValueNullPass(string $table): void
     {
         $r = $this->tableResults[$table];
@@ -347,7 +362,7 @@ final class Scanner
         try {
             foreach ($this->gateway->findRowsWithNullSettingValue($table) as $row) {
                 $count++;
-                $this->findings[] = Finding::fromRow(
+                $this->findings[] = new Finding(
                     $table,
                     $row['pk'],
                     $row['fk'] ?? null,
@@ -377,6 +392,13 @@ final class Scanner
         $this->tableResults[$table] = $r;
     }
 
+    /**
+     * Pass C — resolves the FK for a single settings table, then joins
+     * against the parent table to find rows whose parent entity no longer
+     * exists. Flags each as an ORPHAN_ENTITY finding.
+     *
+     * @param string $table A *_settings table name
+     */
     private function runOrphanPass(string $table): void
     {
         $r = $this->tableResults[$table];
@@ -392,7 +414,7 @@ final class Scanner
                 $orphanFk = sprintf('%s -> %s(%s)', $fk['column'], $fk['parentTable'], $fk['parentColumn']);
                 foreach ($this->gateway->findOrphans($table, $fk['column'], $fk['parentTable'], $fk['parentColumn']) as $row) {
                     $orphanCount++;
-                    $this->findings[] = Finding::fromRow(
+                    $this->findings[] = new Finding(
                         $table,
                         $row['pk'],
                         $row['fk'] ?? null,
@@ -428,6 +450,11 @@ final class Scanner
         $this->tableResults[$table] = $r;
     }
 
+    /**
+     * Pass E — finds submission_files rows stuck in REVIEW_REVISION status
+     * (file_stage = 15). These rows block journal/submission deletion with
+     * a fatal error in OJS CLI.
+     */
     private function runReviewPass(): void
     {
         $status = 'clean';
@@ -435,7 +462,7 @@ final class Scanner
         try {
             foreach ($this->gateway->findReviewRevisionFiles() as $row) {
                 $count++;
-                $this->findings[] = Finding::fromRow(
+                $this->findings[] = new Finding(
                     'submission_files',
                     $row['pk'],
                     $row['fk'] ?? null,
@@ -465,18 +492,9 @@ final class Scanner
 
 
     /**
-     * Backwards-compat alias yielding the eagerly-collected scan() results.
+     * Per-table result metadata collected during scan(). Includes locale-
+     * check and orphan-check statuses, FK descriptors, and finding counts.
      *
-     * @return \Generator<int, Finding>
-     */
-    public function run(): \Generator
-    {
-        foreach ($this->scan() as $f) {
-            yield $f;
-        }
-    }
-
-    /**
      * @return array<string, array{kind:string, settingsChecked:string[], findingsCount:int, status:string, note:string}>
      */
     public function getTableResults(): array
@@ -485,6 +503,9 @@ final class Scanner
     }
 
     /**
+     * Top-level scan context: database name, table counts, and how many
+     * tables were schema-mapped vs. auto-discovered.
+     *
      * @return array{database:string,tablesScanned:int,schemaMapped:int,autoDiscovered:int}
      */
     public function getContextStats(): array
@@ -493,6 +514,8 @@ final class Scanner
     }
 
     /**
+     * Per-entity results from Pass D1 (required-but-null on main tables).
+     *
      * @return array<string, array{table:string,pk:string,nullableRequired:string[],findingsCount:int,status:string,note:string}>
      */
     public function getEntityResults(): array
@@ -501,6 +524,9 @@ final class Scanner
     }
 
     /**
+     * Non-fatal warnings collected during scanning (schema parse failures,
+     * per-table query errors).
+     *
      * @return string[]
      */
     public function getWarnings(): array

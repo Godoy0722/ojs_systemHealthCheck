@@ -9,7 +9,7 @@
  *
  * @class IlluminateDatabaseGateway
  *
- * @brief Real DatabaseGateway impl using Illuminate's Capsule manager. Supports
+ * @brief Database access layer using Illuminate's Capsule manager. Supports
  *        MySQL/MariaDB and PostgreSQL via information_schema. Falls back to
  *        OJS config for the database name when the manager reports it empty.
  *
@@ -21,11 +21,15 @@ namespace APP\tools\settingsHealthCheck\src;
 
 use Illuminate\Database\Capsule\Manager as Capsule;
 
-final class IlluminateDatabaseGateway implements DatabaseGateway
+final class IlluminateDatabaseGateway
 {
     /** @var array<string, array{pk:?string, fk:?string}> */
     private array $tableMetaCache = [];
 
+    /**
+     * Returns the current connection's database name. Falls back to the OJS
+     * config when the Capsule manager reports an empty string.
+     */
     public function getDatabaseName(): string
     {
         try {
@@ -39,6 +43,10 @@ final class IlluminateDatabaseGateway implements DatabaseGateway
         return (string) \Config::getVar('database', 'name');
     }
 
+    /**
+     * Reads the site's primary locale from the `site` table. Falls back to
+     * 'en' when the table is missing or the value is empty.
+     */
     public function getSitePrimaryLocale(): string
     {
         try {
@@ -54,6 +62,9 @@ final class IlluminateDatabaseGateway implements DatabaseGateway
     }
 
     /**
+     * Queries information_schema for every table matching '%_settings' that
+     * has a 'locale' column. Returns deduplicated table names.
+     *
      * @return string[]
      */
     public function discoverSettingsTables(): array
@@ -75,12 +86,20 @@ final class IlluminateDatabaseGateway implements DatabaseGateway
         foreach ($rows as $r) {
             $value = is_object($r) ? ($r->name ?? $r->NAME ?? null) : null;
             if (is_string($value) && $value !== '') {
-                $names[$value] = true;
+                $names[] = $value;
             }
         }
-        return array_keys($names);
+        return array_values(array_unique($names));
     }
 
+    /**
+     * Yields rows from a schema-mapped settings table whose locale is empty
+     * or NULL for the given multilingual setting names (Pass A).
+     *
+     * @param string $table Settings table name
+     * @param string[] $settingNames Multilingual setting_names to check
+     * @return iterable<array{pk:mixed, fk:mixed|null, setting_name:string, locale:string|null, setting_value:string|null}>
+     */
     public function getMultilingualOffenders(string $table, array $settingNames): iterable
     {
         if (empty($settingNames) || !$this->tableExists($table)) {
@@ -94,7 +113,11 @@ final class IlluminateDatabaseGateway implements DatabaseGateway
     }
 
     /**
-     * @return string[]
+     * Auto-discovers setting names that have both localized and non-localized
+     * rows within the same table (mixed-locale pattern used by Pass B).
+     *
+     * @param string $table Settings table name
+     * @return string[] Suspect setting_name values
      */
     public function findSuspectSettingNames(string $table): array
     {
@@ -118,6 +141,14 @@ final class IlluminateDatabaseGateway implements DatabaseGateway
         }, $rows->all());
     }
 
+    /**
+     * Yields rows for the given suspect setting names whose locale is empty
+     * or NULL (Pass B continuation).
+     *
+     * @param string $table Settings table name
+     * @param string[] $settingNames Suspect setting names from findSuspectSettingNames()
+     * @return iterable<array{pk:mixed, fk:mixed|null, setting_name:string, locale:string|null, setting_value:string|null}>
+     */
     public function getEmptyLocaleRowsForSettings(string $table, array $settingNames): iterable
     {
         if (empty($settingNames) || !$this->tableExists($table)) {
@@ -126,6 +157,14 @@ final class IlluminateDatabaseGateway implements DatabaseGateway
         yield from $this->fetchOffenders($table, $settingNames, $this->getTableMeta($table));
     }
 
+    /**
+     * Resolves the foreign-key relationship for a settings table. Uses
+     * information_schema.key_column_usage first; falls back to naming
+     * conventions when the schema has no declared FK constraint.
+     *
+     * @param string $settingsTable Settings table name
+     * @return array{column:string,parentTable:string,parentColumn:string}|null FK info, or null when unresolvable
+     */
     public function getForeignKey(string $settingsTable): ?array
     {
         if (!$this->tableExists($settingsTable)) {
@@ -145,6 +184,7 @@ final class IlluminateDatabaseGateway implements DatabaseGateway
                     $col = is_object($r) ? (string) ($r->col ?? $r->COL ?? '') : '';
                     $parentTable = is_object($r) ? (string) ($r->parent_table ?? $r->PARENT_TABLE ?? '') : '';
                     $parentCol = is_object($r) ? (string) ($r->parent_col ?? $r->PARENT_COL ?? '') : '';
+
                     if ($col !== '' && $parentTable !== '' && $parentCol !== '') {
                         return ['column' => $col, 'parentTable' => $parentTable, 'parentColumn' => $parentCol];
                     }
@@ -167,6 +207,16 @@ final class IlluminateDatabaseGateway implements DatabaseGateway
         return null;
     }
 
+    /**
+     * Yields rows from a settings table whose FK value has no matching row
+     * in the parent table (Pass C — orphan detection).
+     *
+     * @param string $settingsTable Settings table name
+     * @param string $fkCol FK column name
+     * @param string $parentTable Parent (entity) table name
+     * @param string $parentCol Parent PK column name
+     * @return iterable<array{pk:mixed, fk:mixed, setting_name:string, locale:string|null, setting_value:string|null}>
+     */
     public function findOrphans(string $settingsTable, string $fkCol, string $parentTable, string $parentCol): iterable
     {
         if (!$this->tableExists($settingsTable) || !$this->tableExists($parentTable)) {
@@ -205,6 +255,14 @@ final class IlluminateDatabaseGateway implements DatabaseGateway
         }
     }
 
+    /**
+     * Given a list of required column names, returns the subset that are
+     * declared nullable in the information_schema (used by Pass D1).
+     *
+     * @param string $table Table name
+     * @param string[] $candidateColumns Column names to check
+     * @return string[] Subset of columns that are nullable
+     */
     public function filterNullableColumns(string $table, array $candidateColumns): array
     {
         if (empty($candidateColumns) || !$this->tableExists($table)) {
@@ -235,6 +293,15 @@ final class IlluminateDatabaseGateway implements DatabaseGateway
         return $out;
     }
 
+    /**
+     * Yields primary-key values for rows where a specific column is NULL
+     * (Pass D1 — required-but-null on main entity table).
+     *
+     * @param string $table Table name
+     * @param string $pk Primary-key column name
+     * @param string $column Nullable required column to check
+     * @return iterable<array{pk:mixed, column:string}>
+     */
     public function findRowsWithNullColumn(string $table, string $pk, string $column): iterable
     {
         if (!$this->tableExists($table)) {
@@ -254,6 +321,13 @@ final class IlluminateDatabaseGateway implements DatabaseGateway
         }
     }
 
+    /**
+     * Yields rows from a *_settings table where setting_value IS NULL
+     * (Pass D2 — NULL setting_value).
+     *
+     * @param string $settingsTable Settings table name
+     * @return iterable<array{pk:mixed, fk:mixed|null, setting_name:string, locale:string|null, setting_value:null}>
+     */
     public function findRowsWithNullSettingValue(string $settingsTable): iterable
     {
         if (!$this->tableExists($settingsTable)) {
@@ -289,6 +363,16 @@ final class IlluminateDatabaseGateway implements DatabaseGateway
         }
     }
 
+    /**
+     * Deletes a single settings row, scoped by primary key, setting_name,
+     * and locale to avoid collateral damage on composite-key tables.
+     *
+     * @param string $table Settings table name
+     * @param int|string $pk Primary-key value
+     * @param string $settingName
+     * @param string|null $locale
+     * @return int Number of rows deleted
+     */
     public function deleteSettingRow(string $table, $pk, string $settingName, ?string $locale): int
     {
         if (!$this->tableExists($table)) {
@@ -301,6 +385,16 @@ final class IlluminateDatabaseGateway implements DatabaseGateway
         return (int) $query->delete();
     }
 
+    /**
+     * Sets the locale on a single settings row to the given replacement.
+     *
+     * @param string $table Settings table name
+     * @param int|string $pk Primary-key value
+     * @param string $settingName
+     * @param string|null $oldLocale Current (empty) locale to match
+     * @param string $newLocale Replacement locale
+     * @return int Number of rows updated
+     */
     public function setSettingRowLocale(string $table, $pk, string $settingName, ?string $oldLocale, string $newLocale): int
     {
         if (!$this->tableExists($table)) {
@@ -314,11 +408,15 @@ final class IlluminateDatabaseGateway implements DatabaseGateway
     }
 
     /**
-     * Builds a query scoped to exactly the offending row(s). Surrogate-key tables
-     * are pinned by primary key alone; composite-key tables (OJS 3.3) add
-     * setting_name and a locale clause, since the anchor id repeats per row.
+     * Builds an Illuminate query scoped to exactly one offending row.
+     * Surrogate-key tables (OJS 3.5) are pinned by PK alone;
+     * composite-key tables (OJS 3.3) add setting_name and locale clauses
+     * since the entity id repeats per row.
      *
-     * @param int|string $pk
+     * @param string $table Settings table name
+     * @param int|string $pk Primary-key value
+     * @param string $settingName
+     * @param string|null $locale
      * @return \Illuminate\Database\Query\Builder|null null when the table has no usable key
      */
     private function buildRowQuery(string $table, $pk, string $settingName, ?string $locale)
@@ -338,10 +436,12 @@ final class IlluminateDatabaseGateway implements DatabaseGateway
     }
 
     /**
-     * Matches the offending locale. An empty string and NULL are treated as the
-     * same "missing locale" bucket the scanner flagged.
+     * Adds a WHERE clause matching the offending locale. An empty string
+     * and NULL are treated as the same "missing locale" bucket the scanner
+     * flagged.
      *
      * @param \Illuminate\Database\Query\Builder $query
+     * @param string|null $locale
      */
     private function applyLocaleClause($query, ?string $locale): void
     {
@@ -355,11 +455,13 @@ final class IlluminateDatabaseGateway implements DatabaseGateway
     }
 
     /**
-     * Candidate parent table names for an entity FK column, best guess first.
-     * Handles regular and common irregular OJS plurals
-     * (journal_id->journals, controlled_vocab_entry_id->controlled_vocab_entries).
+     * Generates candidate parent-table names from an FK column, best guess
+     * first. Handles regular plurals and common OJS irregulars
+     * (e.g. journal_id → journals, controlled_vocab_entry_id →
+     * controlled_vocab_entries).
      *
-     * @return string[]
+     * @param string $fkCol FK column name ending in '_id'
+     * @return string[] Candidate parent-table names
      */
     private function guessParentTables(string $fkCol): array
     {
@@ -378,7 +480,14 @@ final class IlluminateDatabaseGateway implements DatabaseGateway
     }
 
     /**
-     * @param array{pk:?string,fk:?string} $meta
+     * Shared cursor loop for Pass A and Pass B: queries a settings table
+     * for rows with empty/NULL locale on the given setting names, ordered
+     * by primary key.
+     *
+     * @param string $table Settings table name
+     * @param string[] $settingNames Setting names to filter on
+     * @param array{pk:?string,fk:?string} $meta Cached table metadata
+     * @return iterable<array{pk:mixed, fk:mixed|null, setting_name:string, locale:string|null, setting_value:string|null}>
      */
     private function fetchOffenders(string $table, array $settingNames, array $meta): iterable
     {
@@ -414,6 +523,12 @@ final class IlluminateDatabaseGateway implements DatabaseGateway
         }
     }
 
+    /**
+     * Quick existence check against the Illuminate schema builder.
+     *
+     * @param string $table
+     * @return bool
+     */
     private function tableExists(string $table): bool
     {
         try {
@@ -424,6 +539,12 @@ final class IlluminateDatabaseGateway implements DatabaseGateway
     }
 
     /**
+     * Introspects a table's column list from information_schema and resolves
+     * the primary-key and foreign-key columns. Handles both OJS 3.5-style
+     * (surrogate PK + separate FK) and OJS 3.3-style (composite key where
+     * the entity id is both PK and FK). Results are cached per table.
+     *
+     * @param string $table Table name
      * @return array{pk:?string,fk:?string}
      */
     private function getTableMeta(string $table): array
@@ -503,6 +624,13 @@ final class IlluminateDatabaseGateway implements DatabaseGateway
         return $this->tableMetaCache[$table] = ['pk' => $pk, 'fk' => $fk];
     }
 
+    /**
+     * Yields synthetic rows for submission_files stuck in REVIEW_REVISION
+     * status (file_stage = 15). These rows block journal/submission deletion
+     * in OJS CLI with a fatal error (Pass E).
+     *
+     * @return iterable<array{pk:int, fk:int, setting_name:string, locale:null, setting_value:string}>
+     */
     public function findReviewRevisionFiles(): iterable
     {
         if (!$this->tableExists('submission_files')) {
@@ -528,6 +656,15 @@ final class IlluminateDatabaseGateway implements DatabaseGateway
         }
     }
 
+    /**
+     * Cascade-deletes a submission_file row stuck in REVIEW_REVISION status
+     * along with its revisions, settings, review-round associations, review
+     * files, and notes. Attempts physical file deletion via the OJS file
+     * service but falls back to DB-only cleanup when that fails.
+     *
+     * @param int $submissionFileId
+     * @return int Number of submission_files rows deleted (0 or 1)
+     */
     public function deleteReviewRevisionFile($submissionFileId): int
     {
         if (!$this->tableExists('submission_files')) {
