@@ -70,8 +70,8 @@ final class Finding
         $this->settingName = $settingName;
         $this->locale = $locale;
         $value = (string) ($rawValue ?? '');
-        $this->valuePreview = (strlen($value) > self::VALUE_PREVIEW_MAX)
-            ? substr($value, 0, self::VALUE_PREVIEW_MAX)
+        $this->valuePreview = (mb_strlen($value) > self::VALUE_PREVIEW_MAX)
+            ? mb_substr($value, 0, self::VALUE_PREVIEW_MAX)
             : $value;
         $this->reason = $reason;
         $this->suggestedLocale = $suggestedLocale;

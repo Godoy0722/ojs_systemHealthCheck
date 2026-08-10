@@ -1,26 +1,18 @@
 # Settings Health Check
 
-CLI diagnostic tool for OJS 3.3+ that scans every `*_settings` table for existing data corruption — missing locale tags that cause PHP 8 `TypeError` crashes, orphaned rows, empty required fields, and files stuck in `REVIEW_REVISION` status that block journal deletion.
-
-## Background
-
-OJS `*_settings` tables store multilingual fields as separate rows keyed by locale. When a row that should have a locale tag is stored with an empty or `NULL` locale, PHP 8 cannot hydrate the value and throws a `TypeError`. This tool detects those rows — and several other classes of data corruption — already present in the database.
-
-## Requirements
-
-- OJS 3.3.X
-- PHP 7.4+
-- MySQL/MariaDB or PostgreSQL
+This is a CLI diagnotic tool for OJS 3.3.X that goals to analyse existing data corruption on the database and, if requested, fix the errors based on pre selected scenarios.
 
 ## Usage
 
 Run from the OJS root directory:
 
 ```bash
-php tools/settingsHealthCheck/settingsHealthCheck.php <check> [--fix]
+php tools/settingsHealthCheck/settingsHealthCheck.php [--flags]
 ```
 
-### Checks
+, where the possible tags are listed below:
+
+### Flags
 
 | Flag | Description |
 |------|-------------|
@@ -31,7 +23,7 @@ php tools/settingsHealthCheck/settingsHealthCheck.php <check> [--fix]
 | `-a`, `--all`    | Run all checks above |
 | `-h`, `--help`   | Show usage message |
 
-Checks combine: `--orphan --empty` runs both.
+You can combine flags. E.g.: `--orphan --empty` runs both.
 
 ### Fix mode
 
@@ -39,92 +31,159 @@ Add `-f` or `--fix` to apply remediations:
 
 | Finding type | Fix applied |
 |-------------|-------------|
-| Orphaned rows | **Deleted** from the database |
-| Missing locales | Stamped with the site's primary locale |
+| Orphaned rows | Are **deleted** from the database |
+| Missing locales | The tool stamps with the site's primary locale |
 | Empty fields | **Skipped** — no safe automatic fix; reported for manual review |
-| Review revision files | Files and all associated DB records **deleted** after 3-stage confirmation |
+| Review revision files | Files and all associated DB records are **deleted** after 3-stage confirmation |
 
-**Important:** `--fix` writes to the database. Always run read-only first.
+> **Important Notes**
+>
+> 1. `--fix` writes to the database. Always run read-only first.
+> 2. The **Empty fields** scenario does not have an automatic fix because empty fields can come from plugin databases, and it's not a scenario that can be automatically fixed in a first approach.
 
 ## What It Does
 
-The scanner runs up to 5 detection passes:
+The tool scans every `*_settings` table in the database across 5 passes, looking for data that can break the application or block maintenance operations:
 
-1. **Pass A — Schema-driven locale check** — Parses entity JSON schemas from `lib/pkp/schemas/` and `schemas/` to identify multilingual properties. Queries the corresponding `*_settings` table for rows where those properties have an empty or `NULL` locale.
+1. **Missing locale tags** — Multilingual fields (like journal descriptions or author bios) stored without a locale code. These cause `TypeError` crashes in PHP 8.
 
-2. **Pass B — Heuristic locale check** — For `*_settings` tables not covered by a known schema, auto-discovers setting names that have both localized and non-localized rows (mixed-locale pattern), then flags the empty-locale ones as suspicious.
+2. **Orphaned settings** — Rows whose parent entity was deleted. Leftover data that clutters the database and can surface in unexpected places.
 
-3. **Pass C — Orphan detection** — Resolves foreign-key relationships for each settings table (via `information_schema` constraints or naming conventions). Finds rows whose FK value has no matching row in the parent table.
+3. **Empty required fields** — Columns the schema says must have a value, but contain `NULL`. Also catches `NULL` setting values, which indicate a write that was never completed.
 
-4. **Pass D — Empty-field detection** — D1 checks main entity tables for required-but-`NULL` columns. D2 scans every settings table for rows where `setting_value IS NULL`.
+4. **Review revision files** — Submission files stuck with `file_stage = 15` (`SUBMISSION_FILE_REVIEW_REVISION`). These files cause a **fatal error** when deleting the submission or journal via the OJS command line, because the notification system tries to use the HTTP request context that does not exist in CLI mode.
 
-5. **Pass E — Review revision files** — Finds `submission_files` rows with `file_stage = 15` (`SUBMISSION_FILE_REVIEW_REVISION`), which cause a fatal error (`updateNotification` called without request context) when deleting submissions or journals via CLI.
+5. **Untracked tables** — Tables without a matching JSON schema are checked heuristically for mixed-locale patterns, flagging rows that look out of place.
 
 ## Output
 
-### Exit codes
+The tool prints an interactive report. Warnings (schema parse failures, query errors) go to **stderr**.
 
-| Code | Meaning |
-|------|---------|
-| `0`  | Clean — no findings |
-| `1`  | Findings found — see stdout summary for details |
-| `2`  | Error — check stderr for details |
+### Summary table
 
-### Stdout summary
+Shows a compact overview first — one row per scenario with table and record counts:
 
-Prints a table-by-table breakdown of findings. Example output is shown below.
+```
+┌──────────────────────────────────────────────────────────────┐
+│        Settings Health Check — Scan Results                  │
+├──────────────────────────────────────────────────────────────┤
+│  #  Scenario                                   Tables  Records │
+├──────────────────────────────────────────────────────────────┤
+│  1  Missing locale (schema-driven)                 12      342 │
+│  2  Missing locale (heuristic)                      3       28 │
+│  3  Orphaned settings                               8      156 │
+│  4  Required fields NULL                            2        5 │
+│  5  NULL setting_value                              5       89 │
+│  6  REVIEW_REVISION files                           1       12 │
+└──────────────────────────────────────────────────────────────┘
+  Total: 632 findings across 6 scenarios
 
-Warnings (schema parse failures, query errors) go to **stderr**.
+  Enter [1-6] to see details, [q] to quit:
+```
 
-## Example: Read-Only Scan
+Empty scenarios appear dimmed. If no findings exist at all, the tool prints `No findings — database looks clean.` and exits.
+
+### Drill-down detail
+
+Pick a number to see every row in that scenario, grouped by table:
+
+```
+──────────────────────────────────────────────────────────────────
+  Scenario 1: Missing locale (schema-driven)
+  342 records across 12 tables
+──────────────────────────────────────────────────────────────────
+
+  ▸ author_settings  (45 issues)
+
+    Row #123      (author_id = 456)
+      Problem : A multilingual field was stored without a locale tag. PHP 8
+                cannot hydrate this value and will throw a TypeError.
+      Field   : biography  (no locale tag)
+      Value   : Dr. Smith is a professor of computational linguistics...
+      Suggest : tag this row with locale "en"
+
+    ...
+
+  ▸ journal_settings  (28 issues)
+    ...
+
+──────────────────────────────────────────────────────────────────
+
+  [Enter] menu  |  [s] save to file  |  [q] quit:
+```
+
+### File export
+
+Press `s` at the post-detail prompt to save the current scenario as a plain-text file (no ANSI escape codes). The file is written to the current working directory:
+
+```
+  Saved: /path/to/ojs/settingsHealthCheck_locale_schema_20260810_143022.txt
+```
+
+You can export multiple scenarios in one session.
+
+## Example: Interactive Session
 
 ```bash
 $ php tools/settingsHealthCheck.php --all
 
-  Database: ojs_production
-  Tables scanned: 14   (12 schema-mapped + 2 auto-discovered)
+┌──────────────────────────────────────────────────────────────┐
+│        Settings Health Check — Scan Results                  │
+├──────────────────────────────────────────────────────────────┤
+│  #  Scenario                                   Tables  Records │
+├──────────────────────────────────────────────────────────────┤
+│  1  Missing locale (schema-driven)                  3        9 │
+│  2  Missing locale (heuristic)                      0        0 │
+│  3  Orphaned settings                               2        4 │
+│  4  Required fields NULL                            1        2 │
+│  5  NULL setting_value                              0        0 │
+│  6  REVIEW_REVISION files                           0        0 │
+└──────────────────────────────────────────────────────────────┘
+  Total: 15 findings across 3 scenarios
 
-────────────────────────────────────────────────────────
-  Table-by-table
-────────────────────────────────────────────────────────
-  announcement_settings     schema     2 finding(s)  [findings]
-  author_settings           schema     clean
-  journal_settings          schema     1 finding(s)  [findings]  orphan: 3 finding(s)
-  publication_settings      schema     clean
-  section_settings          schema     clean
-  site_settings             schema     clean
-  submission_settings       schema     clean
-  user_settings             schema     7 finding(s)  [findings]
-  ...
+  Enter [1-6] to see details, [q] to quit: 1
 
-────────────────────────────────────────────────────────────────────────────────
-  Detailed findings (15)
-────────────────────────────────────────────────────────────────────────────────
+──────────────────────────────────────────────────────────────────
+  Scenario 1: Missing locale (schema-driven)
+  9 records across 3 tables
+──────────────────────────────────────────────────────────────────
 
-  Table: announcement_settings   (2 issues)
+  ▸ announcement_settings  (2 issues)
 
-    Row #1  (announcement_id = 42)
-      Problem : A multilingual field was stored without a locale tag. PHP 8 cannot
-                hydrate this value and will throw a TypeError.
+    Row #1      (announcement_id = 42)
+      Problem : A multilingual field was stored without a locale tag...
       Field   : description  (no locale tag)
       Value   : <p>Call for Papers: Special Issue on Digital Humanities</p>
       Suggest : tag this row with locale "en"
 
-    Row #2  (announcement_id = 42)
-      Problem : A multilingual field was stored without a locale tag.
+    Row #2      (announcement_id = 42)
+      Problem : A multilingual field was stored without a locale tag...
       Field   : title  (no locale tag)
       Value   : Special Issue CFP
       Suggest : tag this row with locale "en"
 
-  Table: journal_settings   (1 issue)
+  ▸ journal_settings  (1 issue)
 
-    Row #1  (journal_id = 7)
-      Problem : A multilingual field was stored without a locale tag.
+    Row #1      (journal_id = 7)
+      Problem : A multilingual field was stored without a locale tag...
       Field   : contactEmail  (no locale tag)
       Value   : editor@example.org
       Suggest : tag this row with locale "en"
 
-  ...
+  ▸ user_settings  (6 issues)
+    ...
+
+──────────────────────────────────────────────────────────────────
+
+  [Enter] menu  |  [s] save to file  |  [q] quit: s
+
+  Saved: /var/www/ojs/settingsHealthCheck_locale_schema_20260810_143022.txt
+
+  [Enter] menu  |  [s] save to file  |  [q] quit:
+
+  Enter [1-6] to see details, [q] to quit: q
+
+  Done.
 ```
 
 ## Example: Fix Mode
@@ -191,21 +250,6 @@ $ php tools/settingsHealthCheck.php --review --fix
 4. **Handle empty-field findings manually** — no auto-fix; review each row
 5. **Fix review revision files with caution** — `php tools/settingsHealthCheck.php --review --fix` (requires 3 confirmations)
 
-## Files
-
-```
-tools/settingsHealthCheck/
-├── settingsHealthCheck.php   Entry point (CLI tool class)
-├── README.md                 This file
-└── src/
-    ├── Finding.php           Value object for one flagged row
-    ├── Scanner.php           Detection passes (A through E)
-    ├── SchemaRegistry.php    Loads entity JSON schemas, builds locale/required maps
-    ├── DatabaseGateway.php   Interface for DB read/write operations
-    ├── IlluminateDatabaseGateway.php   Production implementation (Illuminate Capsule)
-    ├── ReportWriter.php      Stdout summary rendering
-    └── Fixer.php             Applies --fix remediations to findings
-```
 
 ## License
 

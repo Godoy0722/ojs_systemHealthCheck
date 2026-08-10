@@ -140,7 +140,7 @@ class SettingsHealthCheckTool extends CommandLineTool
             $context['entityResults'] = $scanner->getEntityResults();
             $context['findings'] = $allFindings;
 
-            echo $writer->renderSummary($context);
+            $writer->renderInteractive($context);
 
             if ($this->fix) {
                 $reviewFindingsCount = 0;
@@ -230,6 +230,11 @@ class SettingsHealthCheckTool extends CommandLineTool
      */
     private function confirmReviewFix(int $count): void
     {
+        if (!(function_exists('stream_isatty') && stream_isatty(STDIN))) {
+            fwrite(STDERR, ReportWriter::color("[ERROR]", 'bold|red') . " Refusing --fix with piped input. Run interactively with a real terminal.\n");
+            exit(2);
+        }
+
         echo "\n";
         echo ReportWriter::color("================================================================================\n", 'bold|red');
         echo ReportWriter::color("WARNING: The scan found {$count} file(s) under the REVIEW_REVISION status.\n", 'bold|red');

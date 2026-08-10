@@ -9,7 +9,9 @@
  *
  * @class ReportWriter
  *
- * @brief Computes finding statistics and renders the stdout summary.
+ * @brief Computes finding statistics and renders an interactive stdout report.
+ *        Shows a summary table first, then lets the user drill into each
+ *        scenario (reason group) to see full-row details.
  */
 
 namespace APP\tools\settingsHealthCheck\src;
@@ -25,11 +27,11 @@ final class ReportWriter
     private const C_GREEN  = "\033[32m";
     private const C_YELLOW = "\033[33m";
     private const C_CYAN   = "\033[36m";
+    private const C_MAGENTA = "\033[35m";
 
     /**
-     * Wrap $text in ANSI color codes. Multiple colors can be combined by
-     * separating them with a pipe, e.g. "bold|red". Pass an empty string as
-     * $color to skip wrapping (returns $text unchanged).
+     * Wrap $text in ANSI color codes. Multiple colors combined via pipe,
+     * e.g. "bold|red". Pass empty string to skip wrapping.
      */
     private static ?bool $supportsColor = null;
 
@@ -62,9 +64,7 @@ final class ReportWriter
     }
 
     /**
-     * Returns the total number of findings. Formerly also computed per-table
-     * breakdowns; now a thin count wrapper kept as its own method so the
-     * call site doesn't couple to count() semantics.
+     * Returns the total number of findings.
      *
      * @param Finding[] $findings
      * @return int
@@ -74,48 +74,341 @@ final class ReportWriter
         return count($findings);
     }
 
-    private const RULE_SINGLE = '────────────────────────────────────────────────────────────────────────────────';
+    // ── Scenario definitions ──────────────────────────────────────────────
 
     /**
-     * Renders the full stdout report: a detailed-findings section grouped by
-     * table, or a short "No findings." notice when the scan turned up nothing.
-     *
-     * @param array{detailCap?:int,findings?:Finding[],tableResults?:array<string,array{orphanFk?:?string}>} $context
-     * @return string
+     * Each scenario maps a menu number to one or more Finding reason codes.
+     * Order here determines the numbered menu order.
      */
-    public function renderSummary(array $context): string
+    private const SCENARIOS = [
+        1 => [
+            'label'   => 'Missing locale (schema-driven)',
+            'reasons' => [Finding::REASON_SCHEMA_MISSING_LOCALE],
+        ],
+        2 => [
+            'label'   => 'Missing locale (heuristic)',
+            'reasons' => [Finding::REASON_HEURISTIC_LOCALE_MISMATCH],
+        ],
+        3 => [
+            'label'   => 'Orphaned settings',
+            'reasons' => [Finding::REASON_ORPHAN_ENTITY],
+        ],
+        4 => [
+            'label'   => 'Required fields NULL',
+            'reasons' => [Finding::REASON_REQUIRED_NULL],
+        ],
+        5 => [
+            'label'   => 'NULL setting_value',
+            'reasons' => [Finding::REASON_SETTING_VALUE_NULL],
+        ],
+        6 => [
+            'label'   => 'REVIEW_REVISION files',
+            'reasons' => [Finding::REASON_REVIEW_REVISION],
+        ],
+    ];
+
+    // ── Public entry point ────────────────────────────────────────────────
+
+    /**
+     * Prints the interactive report: summary table then a drill-down loop.
+     * When STDIN is not a TTY (piped input), prints the summary table only
+     * and exits without entering the interactive loop.
+     *
+     * @param array{findings?:Finding[],tableResults?:array<string,array{orphanFk?:?string}>} $context
+     */
+    public function renderInteractive(array $context): void
     {
         $findings = $context['findings'] ?? [];
+
         if (empty($findings)) {
-            return "\n  " . self::color('No findings.', 'green') . "\n";
+            echo "\n  " . self::color('No findings — database looks clean.', 'green') . "\n\n";
+            return;
         }
 
-        $cap = (int) ($context['detailCap'] ?? 50);
         $tableResults = $context['tableResults'] ?? [];
-        $lines = $this->renderFindingsDetail($findings, $cap, $tableResults);
 
-        return implode("\n", $lines) . "\n";
+        // Group findings into scenario buckets.
+        $buckets = $this->buildBuckets($findings);
+
+        // Always print the summary table.
+        $this->renderSummaryTable($buckets, count($findings));
+
+        // Only enter interactive loop when STDIN is a real terminal.
+        if (!(function_exists('stream_isatty') && stream_isatty(STDIN))) {
+            echo "\n";
+            return;
+        }
+
+        $this->interactiveLoop($buckets, $tableResults);
+    }
+
+    // ── Bucket helpers ────────────────────────────────────────────────────
+
+    /**
+     * Groups findings by scenario number. Each bucket is
+     * ['findings' => Finding[], 'tables' => array<string,int>].
+     *
+     * @param Finding[] $findings
+     * @return array<int, array{findings:Finding[],tables:array<string,int>}>
+     */
+    private function buildBuckets(array $findings): array
+    {
+        $buckets = [];
+        foreach (array_keys(self::SCENARIOS) as $n) {
+            $buckets[$n] = ['findings' => [], 'tables' => []];
+        }
+        foreach ($findings as $f) {
+            $scenario = $this->reasonToScenario($f->reason);
+            if ($scenario === null) {
+                continue;
+            }
+            $buckets[$scenario]['findings'][] = $f;
+            $table = $f->table;
+            $buckets[$scenario]['tables'][$table] = ($buckets[$scenario]['tables'][$table] ?? 0) + 1;
+        }
+        return $buckets;
     }
 
     /**
-     * Builds the detailed-findings block: one sub-section per table, each
-     * row annotated with reason, value preview, and suggested fix. Caps
-     * output at $cap rows to avoid flooding the terminal.
-     *
-     * @param Finding[] $findings
-     * @param int $cap Maximum rows to render before truncating
-     * @param array<string, array{kind:string,settingsChecked:string[],findingsCount:int,status:string,note:string,orphanFk?:?string}> $tableResults
-     * @return string[]
+     * Maps a reason constant to its scenario number.
      */
-    private function renderFindingsDetail(array $findings, int $cap, array $tableResults = []): array
+    private function reasonToScenario(string $reason): ?int
+    {
+        foreach (self::SCENARIOS as $n => $sc) {
+            if (in_array($reason, $sc['reasons'], true)) {
+                return $n;
+            }
+        }
+        return null;
+    }
+
+    // ── Summary table ─────────────────────────────────────────────────────
+
+    /**
+     * Prints the compact summary table with per-scenario counts.
+     *
+     * @param array<int, array{findings:Finding[],tables:array<string,int>}> $buckets
+     * @param int $total Total findings across all scenarios
+     */
+    private function renderSummaryTable(array $buckets, int $total): void
     {
         $c = fn(string $t, string $clr) => self::color($t, $clr);
 
+        $scenariosWithFindings = 0;
+        foreach ($buckets as $b) {
+            if (count($b['findings']) > 0) {
+                $scenariosWithFindings++;
+            }
+        }
+
+        // Table layout: 4 cols — #, Scenario, Tables, Records
+        // Widths: 3 + 36 + 9 + 10 = 58 → use 60 for good measure
+        $wLabel  = 38;  // scenario label
+        $wTables = 8;   // table count
+        $wRecs   = 8;   // record count
+
+        $sepTop    = '┌' . str_repeat('─', $wLabel + $wTables + $wRecs + 10) . '┐';
+        $sepHead   = '├' . str_repeat('─', $wLabel + $wTables + $wRecs + 10) . '┤';
+        $sepBottom = '└' . str_repeat('─', $wLabel + $wTables + $wRecs + 10) . '┘';
+
+        echo "\n";
+        echo $c($sepTop, 'cyan') . "\n";
+        $title = 'Settings Health Check — Scan Results';
+        $pad = (int)((mb_strlen($sepTop) - 2 - mb_strlen($title)) / 2);
+        echo $c('│' . str_repeat(' ', $pad) . $title . str_repeat(' ', mb_strlen($sepTop) - 2 - $pad - mb_strlen($title)) . '│', 'bold|cyan') . "\n";
+        echo $c($sepHead, 'cyan') . "\n";
+
+        // Header row
+        $hNum  = '  #';
+        $hScen = '  Scenario';
+        $hTab  = 'Tables';
+        $hRec  = 'Records';
+        echo $c(
+            '│ ' . str_pad($hNum, 3) . '  ' .
+            str_pad($hScen, $wLabel) . ' ' .
+            str_pad($hTab, $wTables, ' ', STR_PAD_LEFT) . '  ' .
+            str_pad($hRec, $wRecs, ' ', STR_PAD_LEFT) . ' │',
+            'bold|cyan'
+        ) . "\n";
+        echo $c($sepHead, 'cyan') . "\n";
+
+        // Data rows
+        foreach ($buckets as $n => $bucket) {
+            $count  = count($bucket['findings']);
+            $tables = count($bucket['tables']);
+            $label  = self::SCENARIOS[$n]['label'];
+            $dimmed = $count === 0;
+
+            $numStr  = str_pad((string)$n, 2, ' ', STR_PAD_LEFT);
+            $lblStr  = str_pad($label, $wLabel);
+            $tabStr  = str_pad((string)$tables, $wTables, ' ', STR_PAD_LEFT);
+            $recStr  = str_pad((string)$count, $wRecs, ' ', STR_PAD_LEFT);
+
+            if ($dimmed) {
+                echo $c("│  {$numStr}  {$lblStr} {$tabStr}  {$recStr} │", 'dim') . "\n";
+            } else {
+                echo $c('│', 'cyan') . "  {$numStr}  {$lblStr} " .
+                    $c($tabStr, 'yellow') . '  ' .
+                    $c($recStr, 'yellow') . ' ' .
+                    $c('│', 'cyan') . "\n";
+            }
+        }
+
+        // Footer
+        echo $c($sepBottom, 'cyan') . "\n";
+        $footer = "Total: {$total} finding" . ($total === 1 ? '' : 's') .
+                   " across {$scenariosWithFindings} scenario" . ($scenariosWithFindings === 1 ? '' : 's');
+        echo '  ' . $c($footer, 'bold') . "\n\n";
+    }
+
+    // ── Interactive loop ──────────────────────────────────────────────────
+
+    /**
+     * Reads from STDIN: number (1-6) drills into scenario detail,
+     * 'q' / 'Q' quits. Re-prompts on invalid input.
+     *
+     * @param array<int, array{findings:Finding[],tables:array<string,int>}> $buckets
+     * @param array<string, array{orphanFk?:?string}> $tableResults
+     */
+    private function interactiveLoop(array $buckets, array $tableResults): void
+    {
+        $c = fn(string $t, string $clr) => self::color($t, $clr);
+
+        while (true) {
+            echo $c('  Enter [1-6] to see details, [q] to quit: ', 'bold');
+
+            $input = strtolower(trim(fgets(STDIN)));
+            echo "\n";
+
+            if ($input === 'q') {
+                echo '  ' . $c('Done.', 'green') . "\n\n";
+                break;
+            }
+
+            $n = (int)$input;
+            if ($n < 1 || $n > 6) {
+                echo '  ' . $c('Invalid choice. Enter a number 1–6 or "q".', 'yellow') . "\n\n";
+                continue;
+            }
+
+            if (empty($buckets[$n]['findings'])) {
+                echo '  ' . $c('No records in this scenario.', 'dim') . "\n\n";
+                continue;
+            }
+
+            $this->renderScenarioDetail($n, $buckets[$n]['findings'], $tableResults);
+
+            // Post-detail prompt
+            while (true) {
+                echo "\n" . $c('  [Enter] menu  |  [s] save to file  |  [q] quit: ', 'bold');
+                $input2 = strtolower(trim(fgets(STDIN)));
+                if ($input2 === 'q') {
+                    echo "\n  " . $c('Done.', 'green') . "\n\n";
+                    return;
+                }
+                if ($input2 === '') {
+                    echo "\n";
+                    break;
+                }
+                if ($input2 === 's') {
+                    $path = $this->saveScenarioToFile($n, $buckets[$n]['findings'], $tableResults);
+                    if ($path === null) {
+                        echo '  ' . $c('Failed to write file.', 'red') . "\n";
+                    } else {
+                        echo '  ' . $c('Saved: ', 'green') . $path . "\n";
+                    }
+                    continue;
+                }
+                echo '  ' . $c('Press Enter, "s", or "q".', 'yellow') . "\n";
+            }
+        }
+    }
+
+    // ── Scenario detail ───────────────────────────────────────────────────
+
+    /**
+     * Prints every finding for a single scenario, grouped by table.
+     * No row cap — user explicitly asked for full detail.
+     *
+     * @param int $scenario Scenario number (1-6)
+     * @param Finding[] $findings All findings for this scenario
+     * @param array<string, array{orphanFk?:?string}> $tableResults
+     */
+    private function renderScenarioDetail(int $scenario, array $findings, array $tableResults): void
+    {
+        $c   = fn(string $t, string $clr) => self::color($t, $clr);
+        $sep = str_repeat('─', 66);
+
+        $label = self::SCENARIOS[$scenario]['label'];
+        $total = count($findings);
+
+        // Group by table
+        $byTable = [];
+        foreach ($findings as $f) {
+            $byTable[$f->table][] = $f;
+        }
+        ksort($byTable);
+
+        $nTables = count($byTable);
+
+        echo $c($sep, 'cyan') . "\n";
+        echo '  ' . $c("Scenario {$scenario}: {$label}", 'bold') . "\n";
+        echo '  ' . $c("{$total} record" . ($total === 1 ? '' : 's') . " across {$nTables} table" . ($nTables === 1 ? '' : 's'), 'dim') . "\n";
+        echo $c($sep, 'cyan') . "\n\n";
+
+        foreach ($byTable as $table => $rows) {
+            $rowCount = count($rows);
+            $fkInfo = $this->parseFk($tableResults[$table]['orphanFk'] ?? null);
+            $entityLabel = $fkInfo['column'] ?? 'entity_id';
+            $parentTable = $fkInfo['parentTable'] ?? null;
+
+            echo '  ' . $c("▸ {$table}", 'bold|magenta') .
+                 $c("  ({$rowCount} issue" . ($rowCount === 1 ? ')' : 's)'), 'dim') . "\n\n";
+
+            foreach ($rows as $f) {
+                $entity = $f->entityId === null ? '(unknown)' : (string)$f->entityId;
+                echo sprintf('    %-12s %s', $c('Row #' . $f->pk, 'bold'), $c("({$entityLabel} = {$entity})", 'dim')) . "\n";
+                echo '      ' . $c('Problem', 'red') . ' : ' . $this->describeReason($f, $parentTable) . "\n";
+
+                if ($f->reason === Finding::REASON_REQUIRED_NULL) {
+                    echo '      ' . $c('Column', 'cyan') . '  : ' . $f->settingName .
+                         $c('  (declared required, currently NULL)', 'dim') . "\n";
+                } elseif ($f->settingName !== '') {
+                    $localeLabel = ($f->locale === null || $f->locale === '')
+                        ? $c('no locale tag', 'red')
+                        : 'locale "' . $f->locale . '"';
+                    echo '      ' . $c('Field', 'cyan') . '   : ' . $f->settingName . '  (' . $localeLabel . ')' . "\n";
+                }
+
+                if ($f->valuePreview !== '') {
+                    echo '      ' . $c('Value', 'dim') . '   : ' . $this->truncate($f->valuePreview, 100) . "\n";
+                }
+
+                if ($f->suggestedLocale !== '') {
+                    echo '      ' . $c('Suggest', 'green') . ' : tag this row with locale "' . $f->suggestedLocale . '"' . "\n";
+                }
+                echo "\n";
+            }
+        }
+    }
+
+    // ── File export ──────────────────────────────────────────────────────
+
+    /**
+     * Writes the scenario detail to a plain-text file (no ANSI codes).
+     * Returns the absolute path to the saved file.
+     *
+     * @param int $scenario Scenario number (1-6)
+     * @param Finding[] $findings All findings for this scenario
+     * @param array<string, array{orphanFk?:?string}> $tableResults
+     * @return string|null Absolute path of the saved file, null on failure
+     */
+    private function saveScenarioToFile(int $scenario, array $findings, array $tableResults): string
+    {
         $lines = [];
-        $lines[] = '';
-        $lines[] = $c(self::RULE_SINGLE, 'bold|cyan');
-        $lines[] = '  ' . $c('Detailed findings (' . count($findings) . ')', 'bold');
-        $lines[] = $c(self::RULE_SINGLE, 'bold|cyan');
+
+        $label = self::SCENARIOS[$scenario]['label'];
+        $total = count($findings);
 
         $byTable = [];
         foreach ($findings as $f) {
@@ -123,51 +416,85 @@ final class ReportWriter
         }
         ksort($byTable);
 
-        $shown = 0;
+        $nTables = count($byTable);
+
+        $sep = str_repeat('─', 66);
+
+        $lines[] = $sep;
+        $lines[] = "Scenario {$scenario}: {$label}";
+        $lines[] = "{$total} record" . ($total === 1 ? '' : 's') . " across {$nTables} table" . ($nTables === 1 ? '' : 's');
+        $lines[] = $sep;
+        $lines[] = '';
+
         foreach ($byTable as $table => $rows) {
-            $lines[] = '';
-            $lines[] = '  ' . $c('Table: ' . $table, 'bold') . '   (' . count($rows) . ' issue' . (count($rows) === 1 ? '' : 's') . ')';
+            $rowCount = count($rows);
             $fkInfo = $this->parseFk($tableResults[$table]['orphanFk'] ?? null);
             $entityLabel = $fkInfo['column'] ?? 'entity_id';
             $parentTable = $fkInfo['parentTable'] ?? null;
 
+            $lines[] = "▸ {$table}  ({$rowCount} issue" . ($rowCount === 1 ? ')' : 's)');
+            $lines[] = '';
+
             foreach ($rows as $f) {
-                if ($shown >= $cap) {
-                    break 2;
-                }
-                $entity = $f->entityId === null ? '(unknown)' : (string) $f->entityId;
-                $lines[] = sprintf('    Row #%s  (%s = %s)', (string) $f->pk, $entityLabel, $entity);
-                $lines[] = '      ' . $c('Problem', 'red') . ' : ' . $this->describeReason($f, $parentTable);
+                $entity = $f->entityId === null ? '(unknown)' : (string)$f->entityId;
+                $lines[] = sprintf('    Row #%s  (%s = %s)', $f->pk, $entityLabel, $entity);
+                $lines[] = '      Problem : ' . $this->describeReason($f, $parentTable);
+
                 if ($f->reason === Finding::REASON_REQUIRED_NULL) {
-                    $lines[] = '      ' . $c('Column', 'cyan') . '  : ' . $f->settingName . '  (declared required, currently NULL)';
+                    $lines[] = '      Column  : ' . $f->settingName . '  (declared required, currently NULL)';
                 } elseif ($f->settingName !== '') {
-                    $localeLabel = ($f->locale === null || $f->locale === '') ? 'no locale tag' : 'locale "' . $f->locale . '"';
-                    $lines[] = '      ' . $c('Field', 'cyan') . '   : ' . $f->settingName . '  (' . $localeLabel . ')';
+                    $localeLabel = ($f->locale === null || $f->locale === '')
+                        ? 'no locale tag'
+                        : 'locale "' . $f->locale . '"';
+                    $lines[] = '      Field   : ' . $f->settingName . '  (' . $localeLabel . ')';
                 }
+
                 if ($f->valuePreview !== '') {
-                    $lines[] = '      ' . $c('Value', 'dim') . '   : ' . $this->truncate($f->valuePreview, 100);
+                    $lines[] = '      Value   : ' . $this->truncate($f->valuePreview, 100);
                 }
+
                 if ($f->suggestedLocale !== '') {
-                    $lines[] = '      ' . $c('Suggest', 'green') . ' : tag this row with locale "' . $f->suggestedLocale . '"';
+                    $lines[] = '      Suggest : tag this row with locale "' . $f->suggestedLocale . '"';
                 }
-                $shown++;
+                $lines[] = '';
             }
         }
 
-        $remaining = count($findings) - $shown;
-        if ($remaining > 0) {
-            $lines[] = '';
-            $lines[] = '  ... and ' . $remaining . ' more issue' . ($remaining === 1 ? '' : 's');
+        $slug = $this->scenarioSlug($scenario);
+        $timestamp = date('Ymd_His');
+        $filename = "settingsHealthCheck_{$slug}_{$timestamp}.txt";
+        $path = getcwd() . '/' . $filename;
+
+        $bytes = file_put_contents($path, implode("\n", $lines));
+        if ($bytes === false) {
+            return null;
         }
 
-        return $lines;
+        return $path;
     }
 
     /**
-     * Parses a foreign-key descriptor string produced by the orphan pass
-     * (format: "user_id -> users(user_id)") into its three parts.
+     * Short kebab-case identifier per scenario, used in export filenames.
+     */
+    private function scenarioSlug(int $scenario): string
+    {
+        $slugs = [
+            1 => 'locale_schema',
+            2 => 'locale_heuristic',
+            3 => 'orphaned',
+            4 => 'required_null',
+            5 => 'setting_null',
+            6 => 'review_revision',
+        ];
+        return $slugs[$scenario] ?? 'unknown';
+    }
+
+    // ── Shared utilities ──────────────────────────────────────────────────
+
+    /**
+     * Parses a foreign-key descriptor string (format: "user_id -> users(user_id)").
      *
-     * @param string|null $fk FK descriptor or null when no FK was resolved
+     * @param string|null $fk
      * @return array{column:?string,parentTable:?string,parentColumn:?string}
      */
     private function parseFk(?string $fk): array
@@ -175,7 +502,6 @@ final class ReportWriter
         if ($fk === null || $fk === '') {
             return ['column' => null, 'parentTable' => null, 'parentColumn' => null];
         }
-        // Format: "user_id -> users(user_id)"
         if (preg_match('/^(\w+)\s*->\s*(\w+)\(([^)]+)\)$/', $fk, $m)) {
             return ['column' => $m[1], 'parentTable' => $m[2], 'parentColumn' => $m[3]];
         }
@@ -183,11 +509,7 @@ final class ReportWriter
     }
 
     /**
-     * Returns a human-readable explanation for a finding's reason code.
-     *
-     * @param Finding $f The finding to describe
-     * @param string|null $parentTable Parent table name (for orphan context)
-     * @return string
+     * Human-readable explanation for a finding's reason code.
      */
     private function describeReason(Finding $f, ?string $parentTable): string
     {
@@ -212,11 +534,6 @@ final class ReportWriter
 
     /**
      * Truncates a string to $max characters, appending "..." when trimmed.
-     * Uses mb_* functions for safe multi-byte handling.
-     *
-     * @param string $s
-     * @param int $max
-     * @return string
      */
     private function truncate(string $s, int $max): string
     {
