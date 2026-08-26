@@ -27,6 +27,7 @@ require(dirname(__FILE__) . '/../bootstrap.inc.php');
 require_once(dirname(__FILE__) . '/src/Finding.php');
 require_once(dirname(__FILE__) . '/src/IlluminateDatabaseGateway.php');
 require_once(dirname(__FILE__) . '/src/SchemaRegistry.php');
+require_once(dirname(__FILE__) . '/src/JournalCascadeRegistry.php');
 require_once(dirname(__FILE__) . '/src/Scanner.php');
 require_once(dirname(__FILE__) . '/src/ReportWriter.php');
 require_once(dirname(__FILE__) . '/src/Fixer.php');
@@ -34,6 +35,7 @@ require_once(dirname(__FILE__) . '/src/Fixer.php');
 use APP\tools\settingsHealthCheck\src\Finding;
 use APP\tools\settingsHealthCheck\src\Fixer;
 use APP\tools\settingsHealthCheck\src\IlluminateDatabaseGateway;
+use APP\tools\settingsHealthCheck\src\JournalCascadeRegistry;
 use APP\tools\settingsHealthCheck\src\ReportWriter;
 use APP\tools\settingsHealthCheck\src\Scanner;
 use APP\tools\settingsHealthCheck\src\SchemaRegistry;
@@ -84,6 +86,7 @@ class SettingsHealthCheckTool extends CommandLineTool
             -l, --locale    Only missing translations (schema-driven + heuristic guess)
             -e, --empty     Only empty fields (required NULL columns + NULL setting_value)
             -r, --review    Only files under REVIEW_REVISION status (causes deleteJournal error)
+            -d, --deleted-journal  Only rows left behind by deleted journals
             -a, --all       Run every check above (the full scan)
             -h, --help      Show this message
 
@@ -95,7 +98,9 @@ class SettingsHealthCheckTool extends CommandLineTool
                             stamped with the default locale. Empty-field findings
                             are reported but never auto-fixed. Files under REVIEW_REVISION
                             findings are physically deleted along with their database rows,
-                            after multiple confirmation prompts. Combine with a check,
+                            after multiple confirmation prompts. Deleted-journal findings
+                            delete every leftover row belonging to that journal, after the
+                            same multiple confirmation prompts. Combine with a check,
                             e.g. `--review --fix`.
 
         EOT;
@@ -123,7 +128,8 @@ class SettingsHealthCheckTool extends CommandLineTool
             }
 
             $gateway = new IlluminateDatabaseGateway();
-            $scanner = new Scanner($gateway);
+            $cascadeRegistry = new JournalCascadeRegistry($gateway);
+            $scanner = new Scanner($gateway, $cascadeRegistry);
             $writer = new ReportWriter();
 
             $scanner->initialize($schemaMap, $entityMap);
@@ -144,9 +150,14 @@ class SettingsHealthCheckTool extends CommandLineTool
 
             if ($this->fix) {
                 $reviewFindingsCount = 0;
+                $journalFindingsCount = 0;
+                $deadJournals = [];
                 foreach ($allFindings as $f) {
                     if ($f->reason === Finding::REASON_REVIEW_REVISION) {
                         $reviewFindingsCount++;
+                    } elseif ($f->reason === Finding::REASON_DELETED_JOURNAL) {
+                        $journalFindingsCount++;
+                        $deadJournals[(int) $f->entityId] = true;
                     }
                 }
 
@@ -154,7 +165,11 @@ class SettingsHealthCheckTool extends CommandLineTool
                     $this->confirmReviewFix($reviewFindingsCount);
                 }
 
-                $fixer = new Fixer($gateway);
+                if ($journalFindingsCount > 0) {
+                    $this->confirmJournalFix(count($deadJournals), $journalFindingsCount);
+                }
+
+                $fixer = new Fixer($gateway, $cascadeRegistry);
                 $fixResult = $fixer->fix($allFindings);
                 foreach ($fixer->getWarnings() as $w) {
                     fwrite(STDERR, ReportWriter::color("[WARN]", 'bold|yellow') . " {$w}\n");
@@ -201,12 +216,17 @@ class SettingsHealthCheckTool extends CommandLineTool
                 case '--review':
                     $selected[Scanner::CHECK_REVIEW] = true;
                     break;
+                case '-d':
+                case '--deleted-journal':
+                    $selected[Scanner::CHECK_JOURNAL] = true;
+                    break;
                 case '-a':
                 case '--all':
                     $selected[Scanner::CHECK_LOCALE] = true;
                     $selected[Scanner::CHECK_ORPHAN] = true;
                     $selected[Scanner::CHECK_EMPTY] = true;
                     $selected[Scanner::CHECK_REVIEW] = true;
+                    $selected[Scanner::CHECK_JOURNAL] = true;
                     break;
                 case '-f':
                 case '--fix':
@@ -230,6 +250,39 @@ class SettingsHealthCheckTool extends CommandLineTool
      */
     private function confirmReviewFix(int $count): void
     {
+        $this->confirmDestructiveFix([
+            "WARNING: The scan found {$count} file(s) under the REVIEW_REVISION status.",
+            'Fixing these findings will permanently delete these files and their database records.',
+        ]);
+    }
+
+    /**
+     * Three-stage interactive confirmation before deleting the leftovers of
+     * journals that no longer exist. Exits the process immediately if any
+     * stage is declined.
+     *
+     * @param int $journalCount Number of deleted journals with leftover rows
+     * @param int $rowCount Total rows about to be deleted
+     */
+    private function confirmJournalFix(int $journalCount, int $rowCount): void
+    {
+        $this->confirmDestructiveFix([
+            "WARNING: The scan found {$rowCount} row(s) belonging to {$journalCount} deleted journal(s).",
+            'Fixing these findings will permanently delete every one of those rows,',
+            'including submissions, publications, issues and their descendants.',
+        ]);
+    }
+
+    /**
+     * Shared three-stage confirmation used by every destructive fix. Refuses
+     * to run without a real terminal, then requires awareness, a second
+     * confirmation, and the literal word DELETE. Exits the process on any
+     * declined stage.
+     *
+     * @param string[] $warningLines Scenario-specific warning text
+     */
+    private function confirmDestructiveFix(array $warningLines): void
+    {
         if (!(function_exists('stream_isatty') && stream_isatty(STDIN))) {
             fwrite(STDERR, ReportWriter::color("[ERROR]", 'bold|red') . " Refusing --fix with piped input. Run interactively with a real terminal.\n");
             exit(2);
@@ -237,8 +290,9 @@ class SettingsHealthCheckTool extends CommandLineTool
 
         echo "\n";
         echo ReportWriter::color("================================================================================\n", 'bold|red');
-        echo ReportWriter::color("WARNING: The scan found {$count} file(s) under the REVIEW_REVISION status.\n", 'bold|red');
-        echo ReportWriter::color("Fixing these findings will permanently delete these files and their database records.\n", 'bold|red');
+        foreach ($warningLines as $line) {
+            echo ReportWriter::color($line . "\n", 'bold|red');
+        }
         echo ReportWriter::color("================================================================================\n\n", 'bold|red');
 
         echo "Stage 1/3: Are you aware that this operation will delete data in the database? (yes/no): ";
@@ -265,7 +319,7 @@ class SettingsHealthCheckTool extends CommandLineTool
     /**
      * Formats the fix result counters as a compact text block shown after --fix.
      *
-     * @param array{orphansDeleted:int, localesFixed:int, reviewFilesDeleted:int, skipped:int, failed:int} $r
+     * @param array{orphansDeleted:int, localesFixed:int, reviewFilesDeleted:int, journalRecordsDeleted:int, alreadyRemoved:int, skipped:int, failed:int} $r
      */
     private function renderFixSummary(array $r): string
     {
@@ -278,7 +332,11 @@ class SettingsHealthCheckTool extends CommandLineTool
         $lines[] = sprintf('  Orphaned rows deleted : %s', $c((string) $r['orphansDeleted'], 'green'));
         $lines[] = sprintf('  Missing locales set   : %s', $c((string) $r['localesFixed'], 'green'));
         $lines[] = sprintf('  Review files deleted  : %s', $c((string) $r['reviewFilesDeleted'], 'green'));
+        $lines[] = sprintf('  Journal rows deleted  : %s', $c((string) $r['journalRecordsDeleted'], 'green'));
         $lines[] = sprintf('  Empty fields skipped  : %s  (no auto-fix yet)', $c((string) $r['skipped'], 'yellow'));
+        if ($r['alreadyRemoved'] > 0) {
+            $lines[] = sprintf('  Already removed       : %s  (deleted by the journal cascade)', $c((string) $r['alreadyRemoved'], 'dim'));
+        }
         if ($r['failed'] > 0) {
             $lines[] = sprintf('  Failed                : %s  (see warnings above)', $c((string) $r['failed'], 'red'));
         }

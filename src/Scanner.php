@@ -31,6 +31,9 @@ final class Scanner
     /** Pass E: files with REVIEW_REVISION stage. */
     public const CHECK_REVIEW = 'review';
 
+    /** Pass F: rows left behind by an already-deleted journal. */
+    public const CHECK_JOURNAL = 'journal';
+
     private array $contextStats = [
         'database' => '',
         'tablesScanned' => 0,
@@ -53,6 +56,12 @@ final class Scanner
     /** @var array<string, array{table:string,pk:string,nullableRequired:string[],findingsCount:int,status:string,note:string}> */
     private array $entityResults = [];
 
+    /** @var JournalCascadeRegistry|null */
+    private $cascadeRegistry = null;
+
+    /** @var array<int, array{journalId:int, tables:array<string,int>, rows:int}> */
+    private array $deadJournalResults = [];
+
     /** @var string[] */
     private array $unmappedTables = [];
 
@@ -67,11 +76,14 @@ final class Scanner
     private $gateway;
 
     /**
-     * @brief Wires the database gateway used by all detection passes.
+     * @brief Wires the database gateway used by all detection passes, and the
+     *        cascade registry used by Pass F. The registry is optional so the
+     *        other passes can run without building it.
      */
-    public function __construct(IlluminateDatabaseGateway $gateway)
+    public function __construct(IlluminateDatabaseGateway $gateway, ?JournalCascadeRegistry $cascadeRegistry = null)
     {
         $this->gateway = $gateway;
+        $this->cascadeRegistry = $cascadeRegistry;
     }
 
     /**
@@ -138,7 +150,7 @@ final class Scanner
             throw new \LogicException('Scanner::initialize() must be called before scan().');
         }
 
-        $checks = $checks ?? [self::CHECK_LOCALE, self::CHECK_ORPHAN, self::CHECK_EMPTY, self::CHECK_REVIEW];
+        $checks = $checks ?? [self::CHECK_LOCALE, self::CHECK_ORPHAN, self::CHECK_EMPTY, self::CHECK_REVIEW, self::CHECK_JOURNAL];
         $run = array_fill_keys($checks, true);
 
         $this->findings = [];
@@ -256,6 +268,10 @@ final class Scanner
             $this->runReviewPass();
         }
 
+        if (!empty($run[self::CHECK_JOURNAL])) {
+            $this->runDeletedJournalPass();
+        }
+
         $this->finalizeTableResults($run);
 
         return $this->findings;
@@ -276,7 +292,7 @@ final class Scanner
         $orphanRan = !empty($run[self::CHECK_ORPHAN]);
 
         foreach ($this->tableResults as $table => $r) {
-            if ($table === 'submission_files_review') {
+            if ($table === 'submission_files_review' || strpos($table, 'deleted_journal:') === 0) {
                 continue;
             }
             if (!$localeRan) {
@@ -500,6 +516,130 @@ final class Scanner
     public function getTableResults(): array
     {
         return $this->tableResults;
+    }
+
+    /**
+     * Pass F — finds rows still referencing journals that no longer exist.
+     *
+     * OJS never cleans these up: JournalDAO inherits SchemaDAO::deleteById,
+     * which deletes only `journals` and `journal_settings`, and the 3.3 schema
+     * declares no FK constraints. Every other journal-scoped table therefore
+     * survives its journal.
+     *
+     * Resolution runs per dead journal so each one can later be deleted inside
+     * its own transaction. The cascade plan is walked parents-first, carrying
+     * each generation's identity values down to the next.
+     */
+    private function runDeletedJournalPass(): void
+    {
+        if ($this->cascadeRegistry === null) {
+            $this->warnings[] = 'Pass F skipped: no cascade registry supplied';
+            return;
+        }
+
+        try {
+            $plan = $this->cascadeRegistry->build();
+            $deadIds = $this->gateway->findDeadJournalIds($this->cascadeRegistry->getDirectRootColumns());
+        } catch (\Throwable $e) {
+            $this->warnings[] = sprintf('Pass F failed to build the cascade plan: %s', $e->getMessage());
+            return;
+        }
+
+        foreach ($this->cascadeRegistry->getWarnings() as $w) {
+            $this->warnings[] = $w;
+        }
+
+        if (empty($deadIds)) {
+            return;
+        }
+
+        foreach ($deadIds as $journalId) {
+            $idsByTable = [];
+            $rowCount = 0;
+            $tables = [];
+
+            foreach ($plan as $step) {
+                $table = $step['table'];
+                try {
+                    if ($step['source'] === 'journal') {
+                        $ids = $this->gateway->findRowIdsByColumn(
+                            $table,
+                            $step['identity'],
+                            $step['column'],
+                            [$journalId],
+                            $step['assocType']
+                        );
+                    } else {
+                        $parentIds = $idsByTable[$step['parent']] ?? [];
+                        if (empty($parentIds)) {
+                            continue;
+                        }
+                        $ids = $this->gateway->findRowIdsByColumn(
+                            $table,
+                            $step['identity'],
+                            $step['column'],
+                            $parentIds,
+                            null
+                        );
+                    }
+                } catch (\Throwable $e) {
+                    $this->warnings[] = sprintf('Pass F failed for %s (journal %d): %s', $table, $journalId, $e->getMessage());
+                    continue;
+                }
+
+                if (empty($ids)) {
+                    continue;
+                }
+                $idsByTable[$table] = $ids;
+
+                $count = count($ids);
+                $rowCount += $count;
+                $tables[$table] = $count;
+
+                foreach ($ids as $id) {
+                    $this->findings[] = new Finding(
+                        $table,
+                        $id,
+                        $journalId,
+                        $step['column'],
+                        null,
+                        $step['via'],
+                        Finding::REASON_DELETED_JOURNAL,
+                        ''
+                    );
+                }
+
+                $key = 'deleted_journal:' . $table;
+                $prev = $this->tableResults[$key] ?? null;
+                $this->tableResults[$key] = [
+                    'kind' => 'deleted_journal',
+                    'settingsChecked' => [$step['column']],
+                    'findingsCount' => ($prev['findingsCount'] ?? 0) + $count,
+                    'status' => 'findings',
+                    'note' => $step['via'],
+                    'orphanCount' => 0,
+                    'orphanFk' => null,
+                    'orphanStatus' => 'skipped',
+                ];
+            }
+
+            $this->deadJournalResults[$journalId] = [
+                'journalId' => $journalId,
+                'tables' => $tables,
+                'rows' => $rowCount,
+            ];
+        }
+    }
+
+    /**
+     * Per-journal results from Pass F: how many leftover rows each dead
+     * journal owns, and in which tables.
+     *
+     * @return array<int, array{journalId:int, tables:array<string,int>, rows:int}>
+     */
+    public function getDeadJournalResults(): array
+    {
+        return $this->deadJournalResults;
     }
 
     /**

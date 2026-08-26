@@ -22,6 +22,7 @@ final class Finding
     public const REASON_REQUIRED_NULL = 'required_null';
     public const REASON_SETTING_VALUE_NULL = 'setting_value_null';
     public const REASON_REVIEW_REVISION = 'review_revision';
+    public const REASON_DELETED_JOURNAL = 'deleted_journal';
 
     private const VALUE_PREVIEW_MAX = 80;
 

@@ -105,6 +105,10 @@ final class ReportWriter
             'label'   => 'REVIEW_REVISION files',
             'reasons' => [Finding::REASON_REVIEW_REVISION],
         ],
+        7 => [
+            'label'   => 'Deleted journal leftovers',
+            'reasons' => [Finding::REASON_DELETED_JOURNAL],
+        ],
     ];
 
     // ── Public entry point ────────────────────────────────────────────────
@@ -114,7 +118,7 @@ final class ReportWriter
      * When STDIN is not a TTY (piped input), prints the summary table only
      * and exits without entering the interactive loop.
      *
-     * @param array{findings?:Finding[],tableResults?:array<string,array{orphanFk?:?string}>} $context
+     * @param array{findings?:Finding[],tableResults?:array<string,array{orphanFk?:?string}>,entityResults?:array<string,array{pk?:?string}>} $context
      */
     public function renderInteractive(array $context): void
     {
@@ -126,6 +130,7 @@ final class ReportWriter
         }
 
         $tableResults = $context['tableResults'] ?? [];
+        $entityResults = $context['entityResults'] ?? [];
 
         // Group findings into scenario buckets.
         $buckets = $this->buildBuckets($findings);
@@ -139,7 +144,7 @@ final class ReportWriter
             return;
         }
 
-        $this->interactiveLoop($buckets, $tableResults);
+        $this->interactiveLoop($buckets, $tableResults, $entityResults);
     }
 
     // ── Bucket helpers ────────────────────────────────────────────────────
@@ -264,18 +269,19 @@ final class ReportWriter
     // ── Interactive loop ──────────────────────────────────────────────────
 
     /**
-     * Reads from STDIN: number (1-6) drills into scenario detail,
+     * Reads from STDIN: number (1-7) drills into scenario detail,
      * 'q' / 'Q' quits. Re-prompts on invalid input.
      *
      * @param array<int, array{findings:Finding[],tables:array<string,int>}> $buckets
      * @param array<string, array{orphanFk?:?string}> $tableResults
+     * @param array<string, array{pk?:?string}> $entityResults
      */
-    private function interactiveLoop(array $buckets, array $tableResults): void
+    private function interactiveLoop(array $buckets, array $tableResults, array $entityResults): void
     {
         $c = fn(string $t, string $clr) => self::color($t, $clr);
 
         while (true) {
-            echo $c('  Enter [1-6] to see details, [q] to quit: ', 'bold');
+            echo $c('  Enter [1-7] to see details, [q] to quit: ', 'bold');
 
             $input = strtolower(trim(fgets(STDIN)));
             echo "\n";
@@ -286,8 +292,8 @@ final class ReportWriter
             }
 
             $n = (int)$input;
-            if ($n < 1 || $n > 6) {
-                echo '  ' . $c('Invalid choice. Enter a number 1–6 or "q".', 'yellow') . "\n\n";
+            if ($n < 1 || $n > 7) {
+                echo '  ' . $c('Invalid choice. Enter a number 1–7 or "q".', 'yellow') . "\n\n";
                 continue;
             }
 
@@ -296,7 +302,7 @@ final class ReportWriter
                 continue;
             }
 
-            $this->renderScenarioDetail($n, $buckets[$n]['findings'], $tableResults);
+            $this->renderScenarioDetail($n, $buckets[$n]['findings'], $tableResults, $entityResults);
 
             // Post-detail prompt
             while (true) {
@@ -311,7 +317,7 @@ final class ReportWriter
                     break;
                 }
                 if ($input2 === 's') {
-                    $path = $this->saveScenarioToFile($n, $buckets[$n]['findings'], $tableResults);
+                    $path = $this->saveScenarioToFile($n, $buckets[$n]['findings'], $tableResults, $entityResults);
                     if ($path === null) {
                         echo '  ' . $c('Failed to write file.', 'red') . "\n";
                     } else {
@@ -330,11 +336,12 @@ final class ReportWriter
      * Prints every finding for a single scenario, grouped by table.
      * No row cap — user explicitly asked for full detail.
      *
-     * @param int $scenario Scenario number (1-6)
+     * @param int $scenario Scenario number (1-7)
      * @param Finding[] $findings All findings for this scenario
      * @param array<string, array{orphanFk?:?string}> $tableResults
+     * @param array<string, array{pk?:?string}> $entityResults
      */
-    private function renderScenarioDetail(int $scenario, array $findings, array $tableResults): void
+    private function renderScenarioDetail(int $scenario, array $findings, array $tableResults, array $entityResults): void
     {
         $c   = fn(string $t, string $clr) => self::color($t, $clr);
         $sep = str_repeat('─', 66);
@@ -367,12 +374,29 @@ final class ReportWriter
 
             foreach ($rows as $f) {
                 $entity = $f->entityId === null ? '(unknown)' : (string)$f->entityId;
-                echo sprintf('    %-12s %s', $c('Row #' . $f->pk, 'bold'), $c("({$entityLabel} = {$entity})", 'dim')) . "\n";
+                $label = $entityLabel;
+                if ($f->reason === Finding::REASON_DELETED_JOURNAL) {
+                    // entityId carries the dead journal id, not this table's FK value
+                    $label = 'journal_id';
+                } elseif ($f->reason === Finding::REASON_REVIEW_REVISION) {
+                    // entityId carries the submission id, not a settings FK
+                    $label = 'submission_id';
+                } elseif ($f->reason === Finding::REASON_REQUIRED_NULL) {
+                    // entityId is the row's own pk — name it after the table's pk column
+                    $label = $entityResults[$f->table]['pk'] ?? 'entity_id';
+                }
+                echo sprintf('    %-12s %s', $c('Row #' . $f->pk, 'bold'), $c("({$label} = {$entity})", 'dim')) . "\n";
                 echo '      ' . $c('Problem', 'red') . ' : ' . $this->describeReason($f, $parentTable) . "\n";
 
                 if ($f->reason === Finding::REASON_REQUIRED_NULL) {
                     echo '      ' . $c('Column', 'cyan') . '  : ' . $f->settingName .
                          $c('  (declared required, currently NULL)', 'dim') . "\n";
+                } elseif ($f->reason === Finding::REASON_DELETED_JOURNAL) {
+                    echo '      ' . $c('Field', 'cyan') . '   : ' . $f->settingName .
+                         $c('  (journal_id = ' . $entity . ')', 'dim') . "\n";
+                } elseif ($f->reason === Finding::REASON_REVIEW_REVISION) {
+                    echo '      ' . $c('Field', 'cyan') . '   : ' . $f->settingName .
+                         $c('  (submission_id = ' . $entity . ')', 'dim') . "\n";
                 } elseif ($f->settingName !== '') {
                     $localeLabel = ($f->locale === null || $f->locale === '')
                         ? $c('no locale tag', 'red')
@@ -381,7 +405,8 @@ final class ReportWriter
                 }
 
                 if ($f->valuePreview !== '') {
-                    echo '      ' . $c('Value', 'dim') . '   : ' . $this->truncate($f->valuePreview, 100) . "\n";
+                    $valueLabel = $f->reason === Finding::REASON_DELETED_JOURNAL ? 'Via' : 'Value';
+                    echo '      ' . $c($valueLabel, 'dim') . str_repeat(' ', 7 - mb_strlen($valueLabel)) . ': ' . $this->truncate($f->valuePreview, 100) . "\n";
                 }
 
                 if ($f->suggestedLocale !== '') {
@@ -398,12 +423,13 @@ final class ReportWriter
      * Writes the scenario detail to a plain-text file (no ANSI codes).
      * Returns the absolute path to the saved file.
      *
-     * @param int $scenario Scenario number (1-6)
+     * @param int $scenario Scenario number (1-7)
      * @param Finding[] $findings All findings for this scenario
      * @param array<string, array{orphanFk?:?string}> $tableResults
+     * @param array<string, array{pk?:?string}> $entityResults
      * @return string|null Absolute path of the saved file, null on failure
      */
-    private function saveScenarioToFile(int $scenario, array $findings, array $tableResults): string
+    private function saveScenarioToFile(int $scenario, array $findings, array $tableResults, array $entityResults): string
     {
         $lines = [];
 
@@ -437,11 +463,26 @@ final class ReportWriter
 
             foreach ($rows as $f) {
                 $entity = $f->entityId === null ? '(unknown)' : (string)$f->entityId;
-                $lines[] = sprintf('    Row #%s  (%s = %s)', $f->pk, $entityLabel, $entity);
+                $label = $entityLabel;
+                if ($f->reason === Finding::REASON_DELETED_JOURNAL) {
+                    // entityId carries the dead journal id, not this table's FK value
+                    $label = 'journal_id';
+                } elseif ($f->reason === Finding::REASON_REVIEW_REVISION) {
+                    // entityId carries the submission id, not a settings FK
+                    $label = 'submission_id';
+                } elseif ($f->reason === Finding::REASON_REQUIRED_NULL) {
+                    // entityId is the row's own pk — name it after the table's pk column
+                    $label = $entityResults[$f->table]['pk'] ?? 'entity_id';
+                }
+                $lines[] = sprintf('    Row #%s  (%s = %s)', $f->pk, $label, $entity);
                 $lines[] = '      Problem : ' . $this->describeReason($f, $parentTable);
 
                 if ($f->reason === Finding::REASON_REQUIRED_NULL) {
                     $lines[] = '      Column  : ' . $f->settingName . '  (declared required, currently NULL)';
+                } elseif ($f->reason === Finding::REASON_DELETED_JOURNAL) {
+                    $lines[] = '      Field   : ' . $f->settingName . '  (journal_id = ' . $entity . ')';
+                } elseif ($f->reason === Finding::REASON_REVIEW_REVISION) {
+                    $lines[] = '      Field   : ' . $f->settingName . '  (submission_id = ' . $entity . ')';
                 } elseif ($f->settingName !== '') {
                     $localeLabel = ($f->locale === null || $f->locale === '')
                         ? 'no locale tag'
@@ -450,7 +491,8 @@ final class ReportWriter
                 }
 
                 if ($f->valuePreview !== '') {
-                    $lines[] = '      Value   : ' . $this->truncate($f->valuePreview, 100);
+                    $valueLabel = $f->reason === Finding::REASON_DELETED_JOURNAL ? 'Via' : 'Value';
+                    $lines[] = '      ' . str_pad($valueLabel, 7) . ' : ' . $this->truncate($f->valuePreview, 100);
                 }
 
                 if ($f->suggestedLocale !== '') {
@@ -485,6 +527,7 @@ final class ReportWriter
             4 => 'required_null',
             5 => 'setting_null',
             6 => 'review_revision',
+            7 => 'deleted_journal',
         ];
         return $slugs[$scenario] ?? 'unknown';
     }
@@ -527,6 +570,8 @@ final class ReportWriter
                 return 'The setting_value column is NULL. Settings should always have a value (even an empty string); a NULL row means the writer skipped it.';
             case Finding::REASON_REVIEW_REVISION:
                 return 'This submission file has the status REVIEW_REVISION (file_stage = 15). Deleting this submission/journal in OJS CLI causes a Fatal Error due to a missing request context in updateNotification.';
+            case Finding::REASON_DELETED_JOURNAL:
+                return 'This row belongs to journal ' . (string) $f->entityId . ', which no longer exists. OJS deletes only the journals and journal_settings rows, so everything else it owned was left behind.';
             default:
                 return 'Unrecognized issue (' . $f->reason . ').';
         }

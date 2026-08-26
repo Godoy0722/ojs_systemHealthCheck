@@ -20,6 +20,7 @@ php tools/settingsHealthCheck/settingsHealthCheck.php [--flags]
 | `-o`, `--orphan` | Orphaned settings — rows whose parent entity no longer exists |
 | `-e`, `--empty`  | Empty fields — required columns that are `NULL` + settings with `NULL` values |
 | `-r`, `--review` | Review revision files — files stuck in `REVIEW_REVISION` status (causes fatal error on journal deletion) |
+| `-d`, `--deleted-journal` | Deleted journal leftovers — rows still referencing a journal that no longer exists |
 | `-a`, `--all`    | Run all checks above |
 | `-h`, `--help`   | Show usage message |
 
@@ -35,6 +36,7 @@ Add `-f` or `--fix` to apply remediations:
 | Missing locales | The tool stamps with the site's primary locale |
 | Empty fields | **Skipped** — no safe automatic fix; reported for manual review |
 | Review revision files | Files and all associated DB records are **deleted** after 3-stage confirmation |
+| Deleted journal leftovers | Every leftover row is **deleted**, deepest table first, one transaction per journal, after 3-stage confirmation |
 
 > **Important Notes**
 >
@@ -53,7 +55,9 @@ The tool scans every `*_settings` table in the database across 5 passes, looking
 
 4. **Review revision files** — Submission files stuck with `file_stage = 15` (`SUBMISSION_FILE_REVIEW_REVISION`). These files cause a **fatal error** when deleting the submission or journal via the OJS command line, because the notification system tries to use the HTTP request context that does not exist in CLI mode.
 
-5. **Untracked tables** — Tables without a matching JSON schema are checked heuristically for mixed-locale patterns, flagging rows that look out of place.
+5. **Deleted journal leftovers** — Rows still referencing a journal that no longer exists. `JournalDAO` does not override `deleteById`, so it inherits `SchemaDAO::deleteById`, which deletes only the `journals` and `journal_settings` rows. Sections, issues, submissions and their whole descendant trees, subscriptions, plugin settings, metrics and notifications are all left behind, and the OJS 3.3 schema declares no foreign keys to cascade them. This check walks the full cascade and, on `--fix`, removes it.
+
+6. **Untracked tables** — Tables without a matching JSON schema are checked heuristically for mixed-locale patterns, flagging rows that look out of place.
 
 ## Output
 
@@ -75,10 +79,11 @@ Shows a compact overview first — one row per scenario with table and record co
 │  4  Required fields NULL                            2        5 │
 │  5  NULL setting_value                              5       89 │
 │  6  REVIEW_REVISION files                           1       12 │
+│  7  Deleted journal leftovers                       9      417 │
 └──────────────────────────────────────────────────────────────┘
   Total: 632 findings across 6 scenarios
 
-  Enter [1-6] to see details, [q] to quit:
+  Enter [1-7] to see details, [q] to quit:
 ```
 
 Empty scenarios appear dimmed. If no findings exist at all, the tool prints `No findings — database looks clean.` and exits.
@@ -138,10 +143,11 @@ $ php tools/settingsHealthCheck.php --all
 │  4  Required fields NULL                            1        2 │
 │  5  NULL setting_value                              0        0 │
 │  6  REVIEW_REVISION files                           0        0 │
+│  7  Deleted journal leftovers                       0        0 │
 └──────────────────────────────────────────────────────────────┘
   Total: 15 findings across 3 scenarios
 
-  Enter [1-6] to see details, [q] to quit: 1
+  Enter [1-7] to see details, [q] to quit: 1
 
 ──────────────────────────────────────────────────────────────────
   Scenario 1: Missing locale (schema-driven)
@@ -181,7 +187,7 @@ $ php tools/settingsHealthCheck.php --all
 
   [Enter] menu  |  [s] save to file  |  [q] quit:
 
-  Enter [1-6] to see details, [q] to quit: q
+  Enter [1-7] to see details, [q] to quit: q
 
   Done.
 ```
@@ -241,6 +247,7 @@ $ php tools/settingsHealthCheck.php --review --fix
 | `required_null` | **High** | Schema-required column is `NULL` in the database — broken row written |
 | `setting_value_null` | **Low** | `setting_value` is `NULL` — writer skipped this field |
 | `review_revision` | **Critical** | File stuck in `REVIEW_REVISION` status — blocks journal/submission deletion with fatal error |
+| `deleted_journal` | **High** | Row belongs to a journal that no longer exists — OJS leaves these behind on journal deletion |
 
 ## Recommended Workflow
 
@@ -249,6 +256,7 @@ $ php tools/settingsHealthCheck.php --review --fix
 3. **Fix locale/orphan issues** — `php tools/settingsHealthCheck.php --locale --orphan --fix`
 4. **Handle empty-field findings manually** — no auto-fix; review each row
 5. **Fix review revision files with caution** — `php tools/settingsHealthCheck.php --review --fix` (requires 3 confirmations)
+6. **Clean up deleted journals last** — `php tools/settingsHealthCheck/settingsHealthCheck.php --deleted-journal --fix` (requires 3 confirmations; removes whole submission trees)
 
 
 ## License

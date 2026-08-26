@@ -23,6 +23,9 @@ use Illuminate\Database\Capsule\Manager as Capsule;
 
 final class IlluminateDatabaseGateway
 {
+    /** Maximum ids per WHERE IN clause, to keep statements inside driver limits. */
+    private const ID_CHUNK = 500;
+
     /** @var array<string, array{pk:?string, fk:?string}> */
     private array $tableMetaCache = [];
 
@@ -524,12 +527,13 @@ final class IlluminateDatabaseGateway
     }
 
     /**
-     * Quick existence check against the Illuminate schema builder.
+     * Quick existence check against the Illuminate schema builder. Public
+     * because JournalCascadeRegistry verifies its map against the live schema.
      *
      * @param string $table
      * @return bool
      */
-    private function tableExists(string $table): bool
+    public function tableExists(string $table): bool
     {
         try {
             return Capsule::schema()->hasTable($table);
@@ -721,5 +725,162 @@ final class IlluminateDatabaseGateway
         return (int) Capsule::table('submission_files')
             ->where('submission_file_id', $submissionFileId)
             ->delete();
+    }
+
+    /**
+     * Quick column existence check against the Illuminate schema builder.
+     *
+     * @param string $table
+     * @param string $column
+     * @return bool
+     */
+    public function columnExists(string $table, string $column): bool
+    {
+        try {
+            return Capsule::schema()->hasColumn($table, $column);
+        } catch (\Throwable $e) {
+            return false;
+        }
+    }
+
+    /**
+     * Collects journal ids referenced by journal-scoped tables that have no
+     * matching row in `journals` (Pass F). Reads the live journal id set once,
+     * then diffs each root table's distinct references against it.
+     *
+     * @param array<string, string> $roots table => journal reference column
+     * @return int[] Sorted, deduplicated dead journal ids
+     */
+    public function findDeadJournalIds(array $roots): array
+    {
+        if (!$this->tableExists('journals')) {
+            return [];
+        }
+        $live = [];
+        try {
+            foreach (Capsule::table('journals')->select('journal_id')->cursor() as $row) {
+                $live[(int) $row->journal_id] = true;
+            }
+        } catch (\Throwable $e) {
+            return [];
+        }
+
+        $dead = [];
+        foreach ($roots as $table => $column) {
+            if (!$this->tableExists($table) || !$this->columnExists($table, $column)) {
+                continue;
+            }
+            try {
+                $cursor = Capsule::table($table)
+                    ->select($column . ' as jid')
+                    ->whereNotNull($column)
+                    ->distinct()
+                    ->cursor();
+            } catch (\Throwable $e) {
+                continue;
+            }
+            foreach ($cursor as $row) {
+                $id = (int) $row->jid;
+                if ($id > 0 && !isset($live[$id])) {
+                    $dead[$id] = true;
+                }
+            }
+        }
+
+        $out = array_keys($dead);
+        sort($out);
+        return $out;
+    }
+
+    /**
+     * Returns the identity-column values of rows whose $column matches any of
+     * $values. Used both to find rows belonging to a dead journal (matching
+     * journal ids) and to walk one generation down a cascade chain (matching
+     * parent ids). Values are chunked to keep WHERE IN clauses bounded.
+     *
+     * @param string $table Table to read
+     * @param string $identity Column identifying a row
+     * @param string $column Column to match against $values
+     * @param array<int, int|string> $values Journal ids or parent ids
+     * @param int|null $assocType When set, adds an assoc_type equality clause
+     * @return array<int, int|string> Identity values, deduplicated
+     */
+    public function findRowIdsByColumn(string $table, string $identity, string $column, array $values, ?int $assocType = null): array
+    {
+        if (empty($values) || !$this->tableExists($table)) {
+            return [];
+        }
+        if (!$this->columnExists($table, $identity) || !$this->columnExists($table, $column)) {
+            return [];
+        }
+
+        $out = [];
+        foreach (array_chunk(array_values($values), self::ID_CHUNK) as $chunk) {
+            try {
+                $query = Capsule::table($table)
+                    ->select($identity . ' as id')
+                    ->whereIn($column, $chunk);
+                if ($assocType !== null) {
+                    $query->where('assoc_type', $assocType);
+                }
+                $cursor = $query->cursor();
+            } catch (\Throwable $e) {
+                return $out;
+            }
+            foreach ($cursor as $row) {
+                if ($row->id !== null) {
+                    $out[(string) $row->id] = $row->id;
+                }
+            }
+        }
+        return array_values($out);
+    }
+
+    /**
+     * Deletes rows whose $column matches any of $values, in chunks.
+     * WRITES to the database.
+     *
+     * @param string $table Table to delete from
+     * @param string $column Column to match against $values
+     * @param array<int, int|string> $values Identity or FK values to remove
+     * @param int|null $assocType When set, adds an assoc_type equality clause
+     * @return int Number of rows deleted
+     */
+    public function deleteRowsByColumn(string $table, string $column, array $values, ?int $assocType = null): int
+    {
+        if (empty($values) || !$this->tableExists($table) || !$this->columnExists($table, $column)) {
+            return 0;
+        }
+        $deleted = 0;
+        foreach (array_chunk(array_values($values), self::ID_CHUNK) as $chunk) {
+            $query = Capsule::table($table)->whereIn($column, $chunk);
+            if ($assocType !== null) {
+                $query->where('assoc_type', $assocType);
+            }
+            $deleted += (int) $query->delete();
+        }
+        return $deleted;
+    }
+
+    /**
+     * Runs $work inside a database transaction, committing on return and
+     * rolling back on any throwable. The throwable is re-thrown so the caller
+     * can record it per unit of work.
+     *
+     * @param callable():int $work
+     * @return int Whatever $work returned
+     */
+    public function runInTransaction(callable $work): int
+    {
+        $connection = Capsule::connection();
+        $connection->beginTransaction();
+        try {
+            $result = $work();
+            $connection->commit();
+            return $result;
+        } catch (\Throwable $e) {
+            $connection->rollBack();
+            throw $e;
+        }
     }
 }
