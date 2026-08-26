@@ -561,6 +561,47 @@ final class Scanner
             foreach ($plan as $step) {
                 $table = $step['table'];
                 try {
+                    if (!empty($step['aggregate']) && $step['source'] === 'journal') {
+                        $count = $this->gateway->countRowsByColumn(
+                            $table,
+                            $step['column'],
+                            [$journalId],
+                            $step['assocType']
+                        );
+                        if ($count === 0) {
+                            continue;
+                        }
+                        $idsByTable[$table] = [$journalId];
+                        $rowCount += $count;
+                        $tables[$table] = ($tables[$table] ?? 0) + $count;
+
+                        $this->findings[] = new Finding(
+                            $table,
+                            $journalId,
+                            $journalId,
+                            $step['column'],
+                            null,
+                            $step['via'],
+                            Finding::REASON_DELETED_JOURNAL,
+                            '',
+                            $count
+                        );
+
+                        $key = 'deleted_journal:' . $table;
+                        $prev = $this->tableResults[$key] ?? null;
+                        $this->tableResults[$key] = [
+                            'kind' => 'deleted_journal',
+                            'settingsChecked' => [$step['column']],
+                            'findingsCount' => ($prev['findingsCount'] ?? 0) + $count,
+                            'status' => 'findings',
+                            'note' => $step['via'],
+                            'orphanCount' => 0,
+                            'orphanFk' => null,
+                            'orphanStatus' => 'skipped',
+                        ];
+                        continue;
+                    }
+
                     if ($step['source'] === 'journal') {
                         $ids = $this->gateway->findRowIdsByColumn(
                             $table,

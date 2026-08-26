@@ -44,6 +44,15 @@ final class Finding
     public $suggestedLocale;
 
     /**
+     * Rows represented by this finding. Defaults to 1; aggregate cascade
+     * findings (e.g. OJS 3.3 metrics with no surrogate PK) carry the full
+     * table count for one dead journal.
+     *
+     * @var int
+     */
+    public $rowCount;
+
+    /**
      * One flagged row from a *_settings table. Raw values are truncated to
      * VALUE_PREVIEW_MAX for display.
      *
@@ -54,6 +63,7 @@ final class Finding
      * @param string|null $rawValue Raw setting_value from DB (may be null)
      * @param string $reason One of the REASON_* constants
      * @param string $suggestedLocale Locale to fix with, or '' when not applicable
+     * @param int $rowCount Number of DB rows this finding represents (default 1)
      */
     public function __construct(
         string $table,
@@ -63,7 +73,8 @@ final class Finding
         ?string $locale,
         ?string $rawValue,
         string $reason,
-        string $suggestedLocale
+        string $suggestedLocale,
+        int $rowCount = 1
     ) {
         $this->table = $table;
         $this->pk = $pk;
@@ -76,5 +87,6 @@ final class Finding
             : $value;
         $this->reason = $reason;
         $this->suggestedLocale = $suggestedLocale;
+        $this->rowCount = $rowCount > 0 ? $rowCount : 1;
     }
 }

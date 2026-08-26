@@ -64,14 +64,18 @@ final class ReportWriter
     }
 
     /**
-     * Returns the total number of findings.
+     * Returns the total number of rows represented by all findings.
      *
      * @param Finding[] $findings
      * @return int
      */
     public function computeStats(array $findings): int
     {
-        return count($findings);
+        $total = 0;
+        foreach ($findings as $finding) {
+            $total += $finding->rowCount;
+        }
+        return $total;
     }
 
     // ── Scenario definitions ──────────────────────────────────────────────
@@ -136,7 +140,7 @@ final class ReportWriter
         $buckets = $this->buildBuckets($findings);
 
         // Always print the summary table.
-        $this->renderSummaryTable($buckets, count($findings));
+        $this->renderSummaryTable($buckets, $this->sumRowCounts($findings));
 
         // Only enter interactive loop when STDIN is a real terminal.
         if (!(function_exists('stream_isatty') && stream_isatty(STDIN))) {
@@ -169,9 +173,37 @@ final class ReportWriter
             }
             $buckets[$scenario]['findings'][] = $f;
             $table = $f->table;
-            $buckets[$scenario]['tables'][$table] = ($buckets[$scenario]['tables'][$table] ?? 0) + 1;
+            $buckets[$scenario]['tables'][$table] = ($buckets[$scenario]['tables'][$table] ?? 0) + $f->rowCount;
         }
         return $buckets;
+    }
+
+    /**
+     * Sums rowCount across all findings.
+     *
+     * @param Finding[] $findings
+     */
+    private function sumRowCounts(array $findings): int
+    {
+        $total = 0;
+        foreach ($findings as $finding) {
+            $total += $finding->rowCount;
+        }
+        return $total;
+    }
+
+    /**
+     * Sums rowCount for one scenario bucket.
+     *
+     * @param array{findings:Finding[]} $bucket
+     */
+    private function bucketRecordCount(array $bucket): int
+    {
+        $total = 0;
+        foreach ($bucket['findings'] as $finding) {
+            $total += $finding->rowCount;
+        }
+        return $total;
     }
 
     /**
@@ -239,7 +271,7 @@ final class ReportWriter
 
         // Data rows
         foreach ($buckets as $n => $bucket) {
-            $count  = count($bucket['findings']);
+            $count  = $this->bucketRecordCount($bucket);
             $tables = count($bucket['tables']);
             $label  = self::SCENARIOS[$n]['label'];
             $dimmed = $count === 0;
@@ -347,7 +379,7 @@ final class ReportWriter
         $sep = str_repeat('─', 66);
 
         $label = self::SCENARIOS[$scenario]['label'];
-        $total = count($findings);
+        $total = $this->sumRowCounts($findings);
 
         // Group by table
         $byTable = [];
@@ -364,13 +396,13 @@ final class ReportWriter
         echo $c($sep, 'cyan') . "\n\n";
 
         foreach ($byTable as $table => $rows) {
-            $rowCount = count($rows);
+            $rowCount = $this->sumRowCounts($rows);
             $fkInfo = $this->parseFk($tableResults[$table]['orphanFk'] ?? null);
             $entityLabel = $fkInfo['column'] ?? 'entity_id';
             $parentTable = $fkInfo['parentTable'] ?? null;
 
             echo '  ' . $c("▸ {$table}", 'bold|magenta') .
-                 $c("  ({$rowCount} issue" . ($rowCount === 1 ? ')' : 's)'), 'dim') . "\n\n";
+                 $c("  ({$rowCount} record" . ($rowCount === 1 ? ')' : 's)'), 'dim') . "\n\n";
 
             foreach ($rows as $f) {
                 $entity = $f->entityId === null ? '(unknown)' : (string)$f->entityId;
@@ -385,7 +417,10 @@ final class ReportWriter
                     // entityId is the row's own pk — name it after the table's pk column
                     $label = $entityResults[$f->table]['pk'] ?? 'entity_id';
                 }
-                echo sprintf('    %-12s %s', $c('Row #' . $f->pk, 'bold'), $c("({$label} = {$entity})", 'dim')) . "\n";
+                $rowLabel = $f->rowCount > 1
+                    ? 'Journal #' . $f->pk . ' (' . number_format($f->rowCount) . ' rows)'
+                    : 'Row #' . $f->pk;
+                echo sprintf('    %-12s %s', $c($rowLabel, 'bold'), $c("({$label} = {$entity})", 'dim')) . "\n";
                 echo '      ' . $c('Problem', 'red') . ' : ' . $this->describeReason($f, $parentTable) . "\n";
 
                 if ($f->reason === Finding::REASON_REQUIRED_NULL) {
@@ -434,7 +469,7 @@ final class ReportWriter
         $lines = [];
 
         $label = self::SCENARIOS[$scenario]['label'];
-        $total = count($findings);
+        $total = $this->sumRowCounts($findings);
 
         $byTable = [];
         foreach ($findings as $f) {
@@ -453,12 +488,12 @@ final class ReportWriter
         $lines[] = '';
 
         foreach ($byTable as $table => $rows) {
-            $rowCount = count($rows);
+            $rowCount = $this->sumRowCounts($rows);
             $fkInfo = $this->parseFk($tableResults[$table]['orphanFk'] ?? null);
             $entityLabel = $fkInfo['column'] ?? 'entity_id';
             $parentTable = $fkInfo['parentTable'] ?? null;
 
-            $lines[] = "▸ {$table}  ({$rowCount} issue" . ($rowCount === 1 ? ')' : 's)');
+            $lines[] = "▸ {$table}  ({$rowCount} record" . ($rowCount === 1 ? ')' : 's)');
             $lines[] = '';
 
             foreach ($rows as $f) {
@@ -474,7 +509,10 @@ final class ReportWriter
                     // entityId is the row's own pk — name it after the table's pk column
                     $label = $entityResults[$f->table]['pk'] ?? 'entity_id';
                 }
-                $lines[] = sprintf('    Row #%s  (%s = %s)', $f->pk, $label, $entity);
+                $rowLabel = $f->rowCount > 1
+                    ? 'Journal #' . $f->pk . ' (' . number_format($f->rowCount) . ' rows)'
+                    : 'Row #' . $f->pk;
+                $lines[] = sprintf('    %s  (%s = %s)', $rowLabel, $label, $entity);
                 $lines[] = '      Problem : ' . $this->describeReason($f, $parentTable);
 
                 if ($f->reason === Finding::REASON_REQUIRED_NULL) {
@@ -571,7 +609,14 @@ final class ReportWriter
             case Finding::REASON_REVIEW_REVISION:
                 return 'This submission file has the status REVIEW_REVISION (file_stage = 15). Deleting this submission/journal in OJS CLI causes a Fatal Error due to a missing request context in updateNotification.';
             case Finding::REASON_DELETED_JOURNAL:
-                return 'This row belongs to journal ' . (string) $f->entityId . ', which no longer exists. OJS deletes only the journals and journal_settings rows, so everything else it owned was left behind.';
+                $message = 'This row belongs to journal ' . (string) $f->entityId
+                    . ', which no longer exists. OJS deletes only the journals and journal_settings rows,'
+                    . ' so everything else it owned was left behind.';
+                if ($f->rowCount > 1) {
+                    $message .= ' This finding aggregates ' . number_format($f->rowCount)
+                        . ' rows in ' . $f->table . ' (no row-level primary key in this schema).';
+                }
+                return $message;
             default:
                 return 'Unrecognized issue (' . $f->reason . ').';
         }

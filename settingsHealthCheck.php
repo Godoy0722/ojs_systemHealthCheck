@@ -116,8 +116,10 @@ class SettingsHealthCheckTool extends CommandLineTool
     {
         $exitCode = 0;
         try {
-			$libPkpSchemaDir = dirname(__FILE__, 2) . '/lib/pkp/schemas';
-			$schemaDir = dirname(__FILE__, 2) . '/schemas';
+            // OJS root — same anchor as tools/bootstrap.inc.php (INDEX_FILE_LOCATION).
+            $ojsRoot = dirname(INDEX_FILE_LOCATION);
+            $libPkpSchemaDir = $ojsRoot . '/lib/pkp/schemas';
+            $schemaDir = $ojsRoot . '/schemas';
             $registry = new SchemaRegistry($libPkpSchemaDir, $schemaDir);
 
             $schemaMap = $registry->build();

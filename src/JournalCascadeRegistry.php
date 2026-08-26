@@ -37,6 +37,11 @@ final class JournalCascadeRegistry
      * Composite-key settings tables (OJS 3.3 has no surrogate ids on those)
      * reuse the journal column as their identity, matching how Finding::$pk
      * is already populated for composite tables elsewhere in this tool.
+     *
+     * When the preferred identity column is absent from the live schema
+     * (e.g. metrics.metric_id in OJS 3.3), build() falls back to the journal
+     * column and marks the step aggregate so Pass F counts rows instead of
+     * emitting one finding per distinct identity value.
      */
     public const DEFAULT_DIRECT_ROOTS = [
         'journal_settings'      => ['journal_id', 'journal_id'],
@@ -225,12 +230,13 @@ final class JournalCascadeRegistry
      *   assocType— ASSOC_TYPE_JOURNAL for polymorphic roots, else null
      *   depth    — 0 for roots, +1 per generation
      *   via      — human-readable chain, e.g. "submissions > publications"
+     *   aggregate — true when identity equals the journal column (no row-level PK)
      *
      * Tables or columns absent from the live schema are skipped with a
      * warning; their children are skipped too, since they are unreachable.
      * Idempotent — subsequent calls return the cached plan.
      *
-     * @return array<int, array{table:string, identity:string, source:string, column:string, parent:?string, assocType:?int, depth:int, via:string}>
+     * @return array<int, array{table:string, identity:string, source:string, column:string, parent:?string, assocType:?int, depth:int, via:string, aggregate:bool}>
      */
     public function build(): array
     {
@@ -242,8 +248,12 @@ final class JournalCascadeRegistry
         $seen = [];
 
         foreach ($this->directRoots as $table => $cols) {
-            [$journalColumn, $identity] = $cols;
-            if (!$this->verify($table, [$journalColumn, $identity])) {
+            [$journalColumn, $preferredIdentity] = $cols;
+            if (!$this->verifyJournalRoot($table, $journalColumn)) {
+                continue;
+            }
+            $identity = $this->resolveIdentityColumn($table, $journalColumn, $preferredIdentity);
+            if ($identity === null) {
                 continue;
             }
             $this->plan[] = [
@@ -255,6 +265,7 @@ final class JournalCascadeRegistry
                 'assocType' => null,
                 'depth' => 0,
                 'via' => $table,
+                'aggregate' => $identity === $journalColumn,
             ];
             $seen[$table] = true;
             $this->appendChildren($table, $table, 1, $seen);
@@ -273,6 +284,7 @@ final class JournalCascadeRegistry
                 'assocType' => self::ASSOC_TYPE_JOURNAL,
                 'depth' => 0,
                 'via' => $table,
+                'aggregate' => false,
             ];
             $seen[$table] = true;
             $this->appendChildren($table, $table, 1, $seen);
@@ -325,10 +337,53 @@ final class JournalCascadeRegistry
                 'assocType' => null,
                 'depth' => $depth,
                 'via' => $via . ' > ' . $childTable,
+                'aggregate' => false,
             ];
             $seen[$childTable] = true;
             $this->appendChildren($childTable, $via . ' > ' . $childTable, $depth + 1, $seen);
         }
+    }
+
+    /**
+     * Confirms a direct journal root table and its journal column exist.
+     *
+     * @param string $table
+     * @param string $journalColumn
+     * @return bool True when the table and journal column are present
+     */
+    private function verifyJournalRoot(string $table, string $journalColumn): bool
+    {
+        if (!$this->gateway->tableExists($table)) {
+            $this->warnings[] = sprintf('cascade: table %s not present in this database, skipped', $table);
+            return false;
+        }
+        if (!$this->gateway->columnExists($table, $journalColumn)) {
+            $this->warnings[] = sprintf('cascade: %s has no column %s, skipped', $table, $journalColumn);
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * Picks the row-identity column for a direct root. Uses the preferred
+     * surrogate key when present (OJS 3.5+ metrics.metric_id); otherwise
+     * falls back to the journal column for composite OJS 3.3 tables.
+     *
+     * @param string $table
+     * @param string $journalColumn
+     * @param string $preferredIdentity
+     * @return string|null Resolved identity column, or null when unresolvable
+     */
+    private function resolveIdentityColumn(string $table, string $journalColumn, string $preferredIdentity): ?string
+    {
+        if ($this->gateway->columnExists($table, $preferredIdentity)) {
+            return $preferredIdentity;
+        }
+        if ($preferredIdentity !== $journalColumn && $this->gateway->columnExists($table, $journalColumn)) {
+            return $journalColumn;
+        }
+        $this->warnings[] = sprintf('cascade: %s has no column %s, skipped', $table, $preferredIdentity);
+        return null;
     }
 
     /**

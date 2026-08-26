@@ -837,6 +837,38 @@ final class IlluminateDatabaseGateway
     }
 
     /**
+     * Counts rows whose $column matches any of $values. Used by Pass F for
+     * aggregate cascade roots (e.g. OJS 3.3 metrics) that have no row-level
+     * surrogate primary key.
+     *
+     * @param string $table Table to read
+     * @param string $column Column to match against $values
+     * @param array<int, int|string> $values Journal ids or parent ids
+     * @param int|null $assocType When set, adds an assoc_type equality clause
+     * @return int Row count
+     */
+    public function countRowsByColumn(string $table, string $column, array $values, ?int $assocType = null): int
+    {
+        if (empty($values) || !$this->tableExists($table) || !$this->columnExists($table, $column)) {
+            return 0;
+        }
+
+        $total = 0;
+        foreach (array_chunk(array_values($values), self::ID_CHUNK) as $chunk) {
+            try {
+                $query = Capsule::table($table)->whereIn($column, $chunk);
+                if ($assocType !== null) {
+                    $query->where('assoc_type', $assocType);
+                }
+                $total += (int) $query->count();
+            } catch (\Throwable $e) {
+                return $total;
+            }
+        }
+        return $total;
+    }
+
+    /**
      * Deletes rows whose $column matches any of $values, in chunks.
      * WRITES to the database.
      *
