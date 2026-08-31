@@ -11,25 +11,21 @@
  *
  * @ingroup tools
  *
- * @brief CLI diagnostic that scans every *_settings table for rows storing a
- *        multilingual field with an empty/null locale (PHP 8 hydration breaker).
- *        Read-only by default (prints stdout summary); with
- *        --fix it also applies basic remediations to the database.
- *        See REPORT.md for the host05/ajis.aaisnet.org incident that motivated this.
- *
- *        OJS 3.3 / PHP 7.4 port: uses the global Config/CommandLineTool classes,
- *        the Illuminate Capsule manager (the DB facade has no root in 3.3), and
- *        manual require_once for the tool classes (no APP\ autoloader in 3.3).
+ * @brief CLI settings health check. Read-only by default; --fix writes to the DB.
  */
 
 require(dirname(__FILE__) . '/../bootstrap.inc.php');
 
 require_once(dirname(__FILE__) . '/src/Finding.php');
+require_once(dirname(__FILE__) . '/src/SettingsFkRegistry.php');
 require_once(dirname(__FILE__) . '/src/IlluminateDatabaseGateway.php');
 require_once(dirname(__FILE__) . '/src/SchemaRegistry.php');
 require_once(dirname(__FILE__) . '/src/JournalCascadeRegistry.php');
 require_once(dirname(__FILE__) . '/src/Scanner.php');
 require_once(dirname(__FILE__) . '/src/ReportWriter.php');
+require_once(dirname(__FILE__) . '/src/EntityReferenceRule.php');
+require_once(dirname(__FILE__) . '/src/EntityReferenceRegistry.php');
+require_once(dirname(__FILE__) . '/src/OrphanReferenceCleaner.php');
 require_once(dirname(__FILE__) . '/src/Fixer.php');
 
 use APP\tools\settingsHealthCheck\src\Finding;
@@ -42,20 +38,12 @@ use APP\tools\settingsHealthCheck\src\SchemaRegistry;
 
 class SettingsHealthCheckTool extends CommandLineTool
 {
-    /** @var string[]
-	 * Selected Scanner::CHECK_* passes to run.
-	 */
+    /** @var string[] */
     private $checks = [];
 
-    /** @var bool
-	 * Whether to apply fixes for the findings (mutates the DB).
-	 */
+    /** @var bool */
     private $fix = false;
 
-    /**
-     * Parses CLI arguments and selects which Scanner checks to run.
-     * With no arguments, prints usage and exits.
-     */
     public function __construct(array $argv = [])
     {
         parent::__construct($argv);
@@ -68,55 +56,40 @@ class SettingsHealthCheckTool extends CommandLineTool
 
         $selected = $this->argumentWrapper($args);
         $this->checks = array_keys($selected);
+        if (empty($this->checks) && !$this->fix) {
+            $this->usage();
+            exit(0);
+        }
     }
 
-    /**
-     * Prints the CLI help text listing every check flag, fix flag, and usage examples.
-     */
     public function usage(): void
     {
         echo <<<EOT
-            Usage: php tools/settingsHealthCheck.php <check>
-
-            Read-only diagnostic over every *_settings table. Pick one or more checks;
-            running with no check shows this message. Prints a summary to stdout.
+            Usage: php tools/settingsHealthCheck.php <check> [--fix]
 
             Checks:
-            -o, --orphan    Only orphaned settings (parent entity no longer exists)
-            -l, --locale    Only missing translations (schema-driven + heuristic guess)
-            -e, --empty     Only empty fields (required NULL columns + NULL setting_value)
-            -r, --review    Only files under REVIEW_REVISION status (causes deleteJournal error)
-            -d, --deleted-journal  Only rows left behind by deleted journals
-            -a, --all       Run every check above (the full scan)
-            -h, --help      Show this message
+            -o, --orphan           Orphaned settings, entity FK refs, and unreferenced blob files
+            -l, --locale           Bad locale tags on multilingual settings
+            -e, --empty            Required NULL columns and NULL setting_value
+            -r, --review           REVIEW_REVISION files
+            -d, --deleted-journal  Deleted journal leftovers
+            -a, --all              All checks above
+            -h, --help             This message
 
-            Checks combine, e.g. `--orphan --empty` runs both.
-
-            Fix:
-            -f, --fix       Apply basic fixes to the findings (WRITES to the DB):
-                            orphaned rows are deleted, missing-locale rows are
-                            stamped with the default locale. Empty-field findings
-                            are reported but never auto-fixed. Files under REVIEW_REVISION
-                            findings are physically deleted along with their database rows,
-                            after multiple confirmation prompts. Deleted-journal findings
-                            delete every leftover row belonging to that journal, after the
-                            same multiple confirmation prompts. Combine with a check,
-                            e.g. `--review --fix`.
+            -f, --fix              Enable fix mode; press [f] in the menu to apply.
+                                   Re-scans and re-fixes until no fixable rows remain.
 
         EOT;
     }
 
-    /**
-     * Main entry point. Builds the schema registry, initialises the scanner,
-     * runs the selected checks, prints the summary, and optionally applies
-     * fixes (with review-revision confirmation when needed). Exits 0 (clean),
-     * 1 (findings), or 2 (error).
-     */
+    private const MAX_FIX_PASSES = 25;
+
     public function execute(): void
     {
         $exitCode = 0;
         try {
-            // OJS root — same anchor as tools/bootstrap.inc.php (INDEX_FILE_LOCATION).
+            $gateway = new IlluminateDatabaseGateway();
+
             $ojsRoot = dirname(INDEX_FILE_LOCATION);
             $libPkpSchemaDir = $ojsRoot . '/lib/pkp/schemas';
             $schemaDir = $ojsRoot . '/schemas';
@@ -129,7 +102,6 @@ class SettingsHealthCheckTool extends CommandLineTool
                 fwrite(STDERR, ReportWriter::color("[WARN]", 'bold|yellow') . " {$w}\n");
             }
 
-            $gateway = new IlluminateDatabaseGateway();
             $cascadeRegistry = new JournalCascadeRegistry($gateway);
             $scanner = new Scanner($gateway, $cascadeRegistry);
             $writer = new ReportWriter();
@@ -148,35 +120,87 @@ class SettingsHealthCheckTool extends CommandLineTool
             $context['entityResults'] = $scanner->getEntityResults();
             $context['findings'] = $allFindings;
 
-            $writer->renderInteractive($context);
+            $applyFix = $writer->renderInteractive($context, $this->fix);
 
-            if ($this->fix) {
-                $reviewFindingsCount = 0;
-                $journalFindingsCount = 0;
-                $deadJournals = [];
-                foreach ($allFindings as $f) {
-                    if ($f->reason === Finding::REASON_REVIEW_REVISION) {
-                        $reviewFindingsCount++;
-                    } elseif ($f->reason === Finding::REASON_DELETED_JOURNAL) {
-                        $journalFindingsCount++;
-                        $deadJournals[(int) $f->entityId] = true;
+            if ($applyFix) {
+                $this->confirmDestructiveFixes($allFindings);
+
+                $totals = [
+                    'orphansDeleted' => 0,
+                    'orphanFilesDeleted' => 0,
+                    'entityReferencesRecovered' => 0,
+                    'entityOrphansFixed' => 0,
+                    'localesFixed' => 0,
+                    'reviewFilesDeleted' => 0,
+                    'journalRecordsDeleted' => 0,
+                ];
+                $findings = $allFindings;
+                $pass = 0;
+                $lastPassResult = null;
+
+                while ($pass < self::MAX_FIX_PASSES) {
+                    $fixableBefore = $this->countFixableRows($findings);
+                    if ($fixableBefore === 0) {
+                        break;
+                    }
+
+                    $pass++;
+                    if ($pass > 1) {
+                        echo ReportWriter::color(
+                            "\n  Fix pass {$pass} ({$fixableBefore} fixable records remaining)...\n",
+                            'bold|cyan'
+                        );
+                    }
+
+                    $fixer = new Fixer($gateway, $cascadeRegistry);
+                    $fixResult = $fixer->fix($findings);
+                    $lastPassResult = $fixResult;
+                    $this->mergeFixSuccessTotals($totals, $fixResult);
+                    foreach ($fixer->getWarnings() as $w) {
+                        fwrite(STDERR, ReportWriter::color("[WARN]", 'bold|yellow') . " {$w}\n");
+                    }
+
+                    $recheck = $this->checks;
+                    if ($fixResult['journalRecordsDeleted'] > 0) {
+                        $recheck = array_values(array_filter(
+                            $this->checks,
+                            function ($check) {
+                                return $check !== Scanner::CHECK_JOURNAL;
+                            }
+                        ));
+                    }
+                    $findings = $scanner->scan($recheck);
+                    foreach ($scanner->getWarnings() as $w) {
+                        fwrite(STDERR, ReportWriter::color("[WARN]", 'bold|yellow') . " {$w}\n");
+                    }
+
+                    if ($this->countFixableRows($findings) === 0) {
+                        break;
+                    }
+                    if (!$this->fixMadeProgress($fixResult)) {
+                        fwrite(STDERR, ReportWriter::color(
+                            "[WARN] Fix pass {$pass} made no progress; stopping with "
+                            . $this->countFixableRows($findings) . " fixable records left.\n",
+                            'bold|yellow'
+                        ));
+                        break;
+                    }
+                    if ($pass >= 2 && ($fixResult['orphansDeleted'] + $fixResult['localesFixed']
+                        + $fixResult['entityOrphansFixed'] + $fixResult['reviewFilesDeleted']) === 0) {
+                        break;
                     }
                 }
 
-                if ($reviewFindingsCount > 0) {
-                    $this->confirmReviewFix($reviewFindingsCount);
+                if ($pass >= self::MAX_FIX_PASSES && $this->countFixableRows($findings) > 0) {
+                    fwrite(STDERR, ReportWriter::color(
+                        '[WARN] Reached maximum fix passes (' . self::MAX_FIX_PASSES . "); some fixable records remain.\n",
+                        'bold|yellow'
+                    ));
                 }
 
-                if ($journalFindingsCount > 0) {
-                    $this->confirmJournalFix(count($deadJournals), $journalFindingsCount);
-                }
-
-                $fixer = new Fixer($gateway, $cascadeRegistry);
-                $fixResult = $fixer->fix($allFindings);
-                foreach ($fixer->getWarnings() as $w) {
-                    fwrite(STDERR, ReportWriter::color("[WARN]", 'bold|yellow') . " {$w}\n");
-                }
-                echo $this->renderFixSummary($fixResult);
+                $stats = $writer->computeStats($findings);
+                $remainingFixable = $this->countFixableRows($findings);
+                echo $this->renderFixSummary($totals, $pass, $remainingFixable, $lastPassResult, $findings);
             }
 
             $exitCode = $stats > 0 ? 1 : 0;
@@ -187,12 +211,7 @@ class SettingsHealthCheckTool extends CommandLineTool
         exit($exitCode);
     }
 
-	/**
-	 * @param string[] $args
-	 * @return array<string,bool>
-	 *
-	 * This method processes command-line arguments and return the selected checks as an associative array.
-	 */
+	/** @param string[] $args @return array<string,bool> */
 	private function argumentWrapper(array $args): array
 	{
 		$selected = [];
@@ -244,45 +263,163 @@ class SettingsHealthCheckTool extends CommandLineTool
 		return $selected;
 	}
 
-    /**
-     * Three-stage interactive confirmation before deleting review-revision
-     * files. Exits the process immediately if any stage is declined.
-     *
-     * @param int $count Number of REVIEW_REVISION files about to be deleted
-     */
-    private function confirmReviewFix(int $count): void
+    /** @param Finding[] $findings */
+    private function confirmDestructiveFixes(array $findings): void
     {
-        $this->confirmDestructiveFix([
-            "WARNING: The scan found {$count} file(s) under the REVIEW_REVISION status.",
-            'Fixing these findings will permanently delete these files and their database records.',
-        ]);
+        $counts = ['review' => 0, 'journalRows' => 0, 'journalIds' => [], 'journalIdCount' => 0, 'orphanFiles' => 0, 'entityOrphans' => 0];
+        foreach ($findings as $f) {
+            switch ($f->reason) {
+                case Finding::REASON_REVIEW_REVISION:
+                    $counts['review'] += $f->rowCount;
+                    break;
+                case Finding::REASON_DELETED_JOURNAL:
+                    $counts['journalRows'] += $f->rowCount;
+                    if ($f->entityId !== null) {
+                        $counts['journalIds'][(int) $f->entityId] = true;
+                    } elseif (preg_match('/^(\d+) dead journal/', $f->valuePreview, $m)) {
+                        $counts['journalIdCount'] = max($counts['journalIdCount'], (int) $m[1]);
+                    }
+                    break;
+                case Finding::REASON_ORPHAN_ENTITY:
+                    if ($f->table === 'files') {
+                        $counts['orphanFiles'] += $f->rowCount;
+                    } elseif (Finding::isEntityOrphan($f)) {
+                        $counts['entityOrphans'] += $f->rowCount;
+                    }
+                    break;
+            }
+        }
+
+        foreach ([
+            [$counts['review'], [
+                "WARNING: {$counts['review']} file(s) under REVIEW_REVISION.",
+                'Fixing will permanently delete these files and their database records.',
+            ]],
+            [$counts['journalRows'], [
+                'WARNING: ' . $counts['journalRows'] . ' row(s) belonging to '
+                    . (count($counts['journalIds']) ?: $counts['journalIdCount']) . ' deleted journal(s).',
+                'Fixing will permanently delete every one of those rows.',
+            ]],
+            [$counts['orphanFiles'], [
+                "WARNING: {$counts['orphanFiles']} unreferenced blob file(s) in the files table.",
+                'Fixing will delete those files from disk and the database.',
+            ]],
+            [$counts['entityOrphans'], [
+                "WARNING: {$counts['entityOrphans']} entity row(s) with invalid references in live journals.",
+                'Rows will be DELETED or SET NULL after repointing current_publication_id/section_id.',
+            ]],
+        ] as [$n, $lines]) {
+            if ($n > 0) {
+                $this->confirmDestructiveFix($lines);
+            }
+        }
+    }
+
+    /** @param Finding[] $findings */
+    private function countFixableRows(array $findings): int
+    {
+        $total = 0;
+        foreach ($findings as $f) {
+            if ($this->isFixableFinding($f)) {
+                $total += $f->rowCount;
+            }
+        }
+        return $total;
+    }
+
+    private function isFixableFinding(Finding $f): bool
+    {
+        switch ($f->reason) {
+            case Finding::REASON_ORPHAN_ENTITY:
+            case Finding::REASON_SCHEMA_MISSING_LOCALE:
+            case Finding::REASON_HEURISTIC_LOCALE_MISMATCH:
+            case Finding::REASON_REVIEW_REVISION:
+            case Finding::REASON_DELETED_JOURNAL:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /** @param array{orphansDeleted:int, orphanFilesDeleted:int, entityReferencesRecovered:int, entityOrphansFixed:int, localesFixed:int, reviewFilesDeleted:int, journalRecordsDeleted:int, alreadyRemoved:int, skipped:int, failed:int} $result */
+    private function fixMadeProgress(array $result): bool
+    {
+        return ($result['orphansDeleted'] + $result['orphanFilesDeleted'] + $result['entityReferencesRecovered']
+            + $result['entityOrphansFixed'] + $result['localesFixed'] + $result['reviewFilesDeleted']
+            + $result['journalRecordsDeleted'] + $result['alreadyRemoved']) > 0;
     }
 
     /**
-     * Three-stage interactive confirmation before deleting the leftovers of
-     * journals that no longer exist. Exits the process immediately if any
-     * stage is declined.
-     *
-     * @param int $journalCount Number of deleted journals with leftover rows
-     * @param int $rowCount Total rows about to be deleted
+     * @param array{orphansDeleted:int, orphanFilesDeleted:int, entityReferencesRecovered:int, entityOrphansFixed:int, localesFixed:int, reviewFilesDeleted:int, journalRecordsDeleted:int, alreadyRemoved:int, skipped:int, failed:int} $totals
+     * @param array{orphansDeleted:int, orphanFilesDeleted:int, entityReferencesRecovered:int, entityOrphansFixed:int, localesFixed:int, reviewFilesDeleted:int, journalRecordsDeleted:int, alreadyRemoved:int, skipped:int, failed:int} $pass
      */
-    private function confirmJournalFix(int $journalCount, int $rowCount): void
+    private function mergeFixSuccessTotals(array &$totals, array $pass): void
     {
-        $this->confirmDestructiveFix([
-            "WARNING: The scan found {$rowCount} row(s) belonging to {$journalCount} deleted journal(s).",
-            'Fixing these findings will permanently delete every one of those rows,',
-            'including submissions, publications, issues and their descendants.',
-        ]);
+        foreach (['orphansDeleted', 'orphanFilesDeleted', 'entityReferencesRecovered', 'entityOrphansFixed',
+            'localesFixed', 'reviewFilesDeleted', 'journalRecordsDeleted'] as $key) {
+            $totals[$key] += $pass[$key];
+        }
+    }
+
+    /** @param Finding[] $findings */
+    private function countNonFixableRows(array $findings): int
+    {
+        $total = 0;
+        foreach ($findings as $f) {
+            if (!$this->isFixableFinding($f)) {
+                $total += $f->rowCount;
+            }
+        }
+        return $total;
     }
 
     /**
-     * Shared three-stage confirmation used by every destructive fix. Refuses
-     * to run without a real terminal, then requires awareness, a second
-     * confirmation, and the literal word DELETE. Exits the process on any
-     * declined stage.
-     *
-     * @param string[] $warningLines Scenario-specific warning text
+     * @param array{orphansDeleted:int, orphanFilesDeleted:int, entityReferencesRecovered:int, entityOrphansFixed:int, localesFixed:int, reviewFilesDeleted:int, journalRecordsDeleted:int, alreadyRemoved:int, skipped:int, failed:int} $totals
+     * @param array{orphansDeleted:int, orphanFilesDeleted:int, entityReferencesRecovered:int, entityOrphansFixed:int, localesFixed:int, reviewFilesDeleted:int, journalRecordsDeleted:int, alreadyRemoved:int, skipped:int, failed:int}|null $lastPass
+     * @param Finding[] $finalFindings
      */
+    private function renderFixSummary(array $totals, int $passes, int $remainingFixable, ?array $lastPass, array $finalFindings): string
+    {
+        $c = fn(string $t, string $clr) => ReportWriter::color($t, $clr);
+        $failed = $remainingFixable === 0 ? 0 : (int) ($lastPass['failed'] ?? 0);
+        $alreadyRemoved = $remainingFixable === 0 ? 0 : (int) ($lastPass['alreadyRemoved'] ?? 0);
+        $skipped = $this->countNonFixableRows($finalFindings);
+
+        $lines = [];
+        $lines[] = '';
+        $lines[] = '  ' . $c('Fixes applied', 'bold');
+        $lines[] = '  ' . $c('-------------', 'bold');
+        if ($passes > 1) {
+            $lines[] = sprintf('  Fix passes run        : %s', $c((string) $passes, 'cyan'));
+        }
+        if ($totals['entityReferencesRecovered'] > 0) {
+            $lines[] = sprintf('  References recovered  : %s', $c((string) $totals['entityReferencesRecovered'], 'green'));
+        }
+        $lines[] = sprintf('  Orphaned rows deleted : %s', $c((string) $totals['orphansDeleted'], 'green'));
+        $lines[] = sprintf('  Orphan blob files del : %s', $c((string) $totals['orphanFilesDeleted'], 'green'));
+        $lines[] = sprintf('  Entity orphans fixed  : %s', $c((string) $totals['entityOrphansFixed'], 'green'));
+        $lines[] = sprintf('  Missing locales set   : %s', $c((string) $totals['localesFixed'], 'green'));
+        $lines[] = sprintf('  Review files deleted  : %s', $c((string) $totals['reviewFilesDeleted'], 'green'));
+        $lines[] = sprintf('  Journal rows deleted  : %s', $c((string) $totals['journalRecordsDeleted'], 'green'));
+        $lines[] = sprintf('  Empty fields skipped  : %s  (no auto-fix yet)', $c((string) $skipped, 'yellow'));
+        if ($alreadyRemoved > 0) {
+            $lines[] = sprintf('  Already removed       : %s  (deleted by the journal cascade)', $c((string) $alreadyRemoved, 'dim'));
+        }
+        if ($failed > 0) {
+            $lines[] = sprintf('  Failed                : %s  (see warnings above)', $c((string) $failed, 'red'));
+        }
+        if ($remainingFixable > 0) {
+            $lines[] = sprintf(
+                '  Fixable remaining     : %s  (blocked or could not progress)',
+                $c((string) $remainingFixable, 'yellow')
+            );
+        } elseif ($passes > 0) {
+            $lines[] = '  ' . $c('All fixable records resolved.', 'green');
+        }
+        return implode("\n", $lines) . "\n";
+    }
+
+    /** @param string[] $warningLines */
     private function confirmDestructiveFix(array $warningLines): void
     {
         if (!(function_exists('stream_isatty') && stream_isatty(STDIN))) {
@@ -316,33 +453,6 @@ class SettingsHealthCheckTool extends CommandLineTool
         }
 
         echo ReportWriter::color("\nConfirmation successful. Moving forward with the execution...\n\n", 'green');
-    }
-
-    /**
-     * Formats the fix result counters as a compact text block shown after --fix.
-     *
-     * @param array{orphansDeleted:int, localesFixed:int, reviewFilesDeleted:int, journalRecordsDeleted:int, alreadyRemoved:int, skipped:int, failed:int} $r
-     */
-    private function renderFixSummary(array $r): string
-    {
-        $c = fn(string $t, string $clr) => ReportWriter::color($t, $clr);
-
-        $lines = [];
-        $lines[] = '';
-        $lines[] = '  ' . $c('Fixes applied', 'bold');
-        $lines[] = '  ' . $c('-------------', 'bold');
-        $lines[] = sprintf('  Orphaned rows deleted : %s', $c((string) $r['orphansDeleted'], 'green'));
-        $lines[] = sprintf('  Missing locales set   : %s', $c((string) $r['localesFixed'], 'green'));
-        $lines[] = sprintf('  Review files deleted  : %s', $c((string) $r['reviewFilesDeleted'], 'green'));
-        $lines[] = sprintf('  Journal rows deleted  : %s', $c((string) $r['journalRecordsDeleted'], 'green'));
-        $lines[] = sprintf('  Empty fields skipped  : %s  (no auto-fix yet)', $c((string) $r['skipped'], 'yellow'));
-        if ($r['alreadyRemoved'] > 0) {
-            $lines[] = sprintf('  Already removed       : %s  (deleted by the journal cascade)', $c((string) $r['alreadyRemoved'], 'dim'));
-        }
-        if ($r['failed'] > 0) {
-            $lines[] = sprintf('  Failed                : %s  (see warnings above)', $c((string) $r['failed'], 'red'));
-        }
-        return implode("\n", $lines) . "\n";
     }
 
 }

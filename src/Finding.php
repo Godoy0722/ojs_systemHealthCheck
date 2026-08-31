@@ -43,28 +43,9 @@ final class Finding
     /** @var string */
     public $suggestedLocale;
 
-    /**
-     * Rows represented by this finding. Defaults to 1; aggregate cascade
-     * findings (e.g. OJS 3.3 metrics with no surrogate PK) carry the full
-     * table count for one dead journal.
-     *
-     * @var int
-     */
+    /** @var int Aggregate row count (defaults to 1). */
     public $rowCount;
 
-    /**
-     * One flagged row from a *_settings table. Raw values are truncated to
-     * VALUE_PREVIEW_MAX for display.
-     *
-     * @param int|string $pk Primary-key value of the offending row
-     * @param int|string|null $entityId Parent entity id (FK column value)
-     * @param string $settingName Name of the affected setting
-     * @param string|null $locale Locale tag (null or empty = missing)
-     * @param string|null $rawValue Raw setting_value from DB (may be null)
-     * @param string $reason One of the REASON_* constants
-     * @param string $suggestedLocale Locale to fix with, or '' when not applicable
-     * @param int $rowCount Number of DB rows this finding represents (default 1)
-     */
     public function __construct(
         string $table,
         $pk,
@@ -88,5 +69,25 @@ final class Finding
         $this->reason = $reason;
         $this->suggestedLocale = $suggestedLocale;
         $this->rowCount = $rowCount > 0 ? $rowCount : 1;
+    }
+
+    public const BULK_PREFIX = 'bulk:';
+
+    public static function isEntityOrphan(self $f): bool
+    {
+        return $f->reason === self::REASON_ORPHAN_ENTITY
+            && $f->table !== 'files'
+            && strpos((string) $f->pk, '->') !== false;
+    }
+
+    /** Aggregate finding — fixed with one bulk SQL statement, not row-by-row. */
+    public static function isBulk(self $f): bool
+    {
+        return is_string($f->pk) && strpos($f->pk, self::BULK_PREFIX) === 0;
+    }
+
+    public static function bulkPk(string $kind, string $detail = ''): string
+    {
+        return self::BULK_PREFIX . $kind . ($detail !== '' ? ':' . $detail : '');
     }
 }

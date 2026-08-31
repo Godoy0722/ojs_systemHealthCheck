@@ -16,12 +16,12 @@ php tools/settingsHealthCheck/settingsHealthCheck.php [--flags]
 
 | Flag | Description |
 |------|-------------|
-| `-l`, `--locale` | Missing translations — multilingual fields stored without a locale tag |
-| `-o`, `--orphan` | Orphaned settings — rows whose parent entity no longer exists |
+| `-l`, `--locale` | Bad locale tags — multilingual settings rows stored with empty/null `locale` (PHP 8 corruption risk). See [locale coverage](docs/locale-coverage.md). |
+| `-o`, `--orphan` | Orphaned settings, invalid entity FK refs in live journals, and unreferenced blob files. See [orphan entity coverage](docs/orphan-entity-coverage.md). |
 | `-e`, `--empty`  | Empty fields — required columns that are `NULL` + settings with `NULL` values |
 | `-r`, `--review` | Review revision files — files stuck in `REVIEW_REVISION` status (causes fatal error on journal deletion) |
 | `-d`, `--deleted-journal` | Deleted journal leftovers — rows still referencing a journal that no longer exists |
-| `-a`, `--all`    | Run all checks above |
+| `-a`, `--all`    | Run every check above |
 | `-h`, `--help`   | Show usage message |
 
 You can combine flags. E.g.: `--orphan --empty` runs both.
@@ -32,8 +32,8 @@ Add `-f` or `--fix` to apply remediations:
 
 | Finding type | Fix applied |
 |-------------|-------------|
-| Orphaned rows | Are **deleted** from the database |
-| Missing locales | The tool stamps with the site's primary locale |
+| Orphaned rows | Settings rows are **deleted** (FK orphans and invalid `issueId`). Invalid entity FK columns in live journals are **repointed first** (`current_publication_id`, `section_id`), then remaining orphans are **deleted or set to NULL**. Unreferenced blob files are **deleted from disk and the database** |
+| Missing locales | Retags existing bad rows with the site's primary locale |
 | Empty fields | **Skipped** — no safe automatic fix; reported for manual review |
 | Review revision files | Files and all associated DB records are **deleted** after 3-stage confirmation |
 | Deleted journal leftovers | Every leftover row is **deleted**, deepest table first, one transaction per journal, after 3-stage confirmation |
@@ -47,9 +47,9 @@ Add `-f` or `--fix` to apply remediations:
 
 The tool scans every `*_settings` table in the database across 5 passes, looking for data that can break the application or block maintenance operations:
 
-1. **Missing locale tags** — Multilingual fields (like journal descriptions or author bios) stored without a locale code. These cause `TypeError` crashes in PHP 8.
+1. **Bad locale tags** — `*_settings` rows where a multilingual field was saved with an empty or `NULL` locale code. These cause `TypeError` crashes in PHP 8. See [locale coverage](docs/locale-coverage.md).
 
-2. **Orphaned settings** — Rows whose parent entity was deleted. Leftover data that clutters the database and can surface in unexpected places.
+2. **Orphaned settings, entities & files** — Settings rows whose parent entity was deleted; invalid entity FK columns inside live journals (e.g. `submission_files.submission_id` pointing to a missing submission); invalid stored values (e.g. `publication_settings.issueId`); and unreferenced rows in the central `files` blob table.
 
 3. **Empty required fields** — Columns the schema says must have a value, but contain `NULL`. Also catches `NULL` setting values, which indicate a write that was never completed.
 
@@ -57,7 +57,7 @@ The tool scans every `*_settings` table in the database across 5 passes, looking
 
 5. **Deleted journal leftovers** — Rows still referencing a journal that no longer exists. `JournalDAO` does not override `deleteById`, so it inherits `SchemaDAO::deleteById`, which deletes only the `journals` and `journal_settings` rows. Sections, issues, submissions and their whole descendant trees, subscriptions, plugin settings, metrics and notifications are all left behind, and the OJS 3.3 schema declares no foreign keys to cascade them. This check walks the full cascade and, on `--fix`, removes it.
 
-6. **Untracked tables** — Tables without a matching JSON schema are checked heuristically for mixed-locale patterns, flagging rows that look out of place.
+6. **Untracked tables** — Settings tables without a schema mapping are checked heuristically: same `setting_name` with both tagged and empty-locale rows.
 
 ## Output
 
@@ -73,17 +73,16 @@ Shows a compact overview first — one row per scenario with table and record co
 ├──────────────────────────────────────────────────────────────┤
 │  #  Scenario                                   Tables  Records │
 ├──────────────────────────────────────────────────────────────┤
-│  1  Missing locale (schema-driven)                 12      342 │
-│  2  Missing locale (heuristic)                      3       28 │
-│  3  Orphaned settings                               8      156 │
-│  4  Required fields NULL                            2        5 │
-│  5  NULL setting_value                              5       89 │
-│  6  REVIEW_REVISION files                           1       12 │
-│  7  Deleted journal leftovers                       9      417 │
+│  1  Bad locale tags                                15      370 │
+│  2  Orphaned settings, entities & files             8      156 │
+│  3  Required fields NULL                            2        5 │
+│  4  NULL setting_value                              5       89 │
+│  5  REVIEW_REVISION files                           1       12 │
+│  6  Deleted journal leftovers                       9      417 │
 └──────────────────────────────────────────────────────────────┘
   Total: 632 findings across 6 scenarios
 
-  Enter [1-7] to see details, [q] to quit:
+  Enter [1-6] to see details, [q] to quit:
 ```
 
 Empty scenarios appear dimmed. If no findings exist at all, the tool prints `No findings — database looks clean.` and exits.
@@ -94,7 +93,7 @@ Pick a number to see every row in that scenario, grouped by table:
 
 ```
 ──────────────────────────────────────────────────────────────────
-  Scenario 1: Missing locale (schema-driven)
+  Scenario 1: Bad locale tags
   342 records across 12 tables
 ──────────────────────────────────────────────────────────────────
 
@@ -122,7 +121,7 @@ Pick a number to see every row in that scenario, grouped by table:
 Press `s` at the post-detail prompt to save the current scenario as a plain-text file (no ANSI escape codes). The file is written to the current working directory:
 
 ```
-  Saved: /path/to/ojs/settingsHealthCheck_locale_schema_20260810_143022.txt
+  Saved: /path/to/ojs/settingsHealthCheck_locale_20260810_143022.txt
 ```
 
 You can export multiple scenarios in one session.
@@ -137,20 +136,19 @@ $ php tools/settingsHealthCheck.php --all
 ├──────────────────────────────────────────────────────────────┤
 │  #  Scenario                                   Tables  Records │
 ├──────────────────────────────────────────────────────────────┤
-│  1  Missing locale (schema-driven)                  3        9 │
-│  2  Missing locale (heuristic)                      0        0 │
-│  3  Orphaned settings                               2        4 │
-│  4  Required fields NULL                            1        2 │
-│  5  NULL setting_value                              0        0 │
-│  6  REVIEW_REVISION files                           0        0 │
-│  7  Deleted journal leftovers                       0        0 │
+│  1  Bad locale tags                                 3        9 │
+│  2  Orphaned settings, entities & files             2        4 │
+│  3  Required fields NULL                            1        2 │
+│  4  NULL setting_value                              0        0 │
+│  5  REVIEW_REVISION files                           0        0 │
+│  6  Deleted journal leftovers                       0        0 │
 └──────────────────────────────────────────────────────────────┘
   Total: 15 findings across 3 scenarios
 
-  Enter [1-7] to see details, [q] to quit: 1
+  Enter [1-6] to see details, [q] to quit: 1
 
 ──────────────────────────────────────────────────────────────────
-  Scenario 1: Missing locale (schema-driven)
+  Scenario 1: Bad locale tags
   9 records across 3 tables
 ──────────────────────────────────────────────────────────────────
 
@@ -183,11 +181,11 @@ $ php tools/settingsHealthCheck.php --all
 
   [Enter] menu  |  [s] save to file  |  [q] quit: s
 
-  Saved: /var/www/ojs/settingsHealthCheck_locale_schema_20260810_143022.txt
+  Saved: /var/www/ojs/settingsHealthCheck_locale_20260810_143022.txt
 
   [Enter] menu  |  [s] save to file  |  [q] quit:
 
-  Enter [1-7] to see details, [q] to quit: q
+  Enter [1-6] to see details, [q] to quit: q
 
   Done.
 ```
@@ -241,9 +239,9 @@ $ php tools/settingsHealthCheck.php --review --fix
 
 | Reason code | Severity | Description |
 |-------------|----------|-------------|
-| `schema_missing_locale` | **High** | Multilingual field missing locale tag — PHP 8 `TypeError` risk |
-| `heuristic_locale_mismatch` | **Medium** | Setting has mixed localized/non-localized rows; empty-locale rows look out of place |
-| `orphan_entity` | **Medium** | Row references a parent entity that no longer exists — dangling data |
+| `schema_missing_locale` | **High** | Known multilingual field on an existing row with empty/null locale — PHP 8 `TypeError` risk |
+| `heuristic_locale_mismatch` | **Medium** | Same setting name has both tagged and empty-locale rows; empty ones look corrupt |
+| `orphan_entity` | **Medium** | Dangling reference — settings parent missing, invalid stored FK (e.g. `issueId`), invalid entity FK column in a live journal, or unreferenced blob file |
 | `required_null` | **High** | Schema-required column is `NULL` in the database — broken row written |
 | `setting_value_null` | **Low** | `setting_value` is `NULL` — writer skipped this field |
 | `review_revision` | **Critical** | File stuck in `REVIEW_REVISION` status — blocks journal/submission deletion with fatal error |

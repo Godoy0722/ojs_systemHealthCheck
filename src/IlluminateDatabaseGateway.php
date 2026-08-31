@@ -26,6 +26,24 @@ final class IlluminateDatabaseGateway
     /** Maximum ids per WHERE IN clause, to keep statements inside driver limits. */
     private const ID_CHUNK = 500;
 
+    /**
+     * Tables with an FK to central `files.file_id`. Matches OJS 3.4
+     * PreflightCheckMigration::getEntityRelationships():
+     *   'files' => ['submission_files', 'submission_file_revisions']
+     * Verified on OJS 3.3 via information_schema (only these two FKs).
+     *
+     * Not included — separate storage, different file_id namespace:
+     *   issue_files, library_files, temporary_files, draft_dataset_files
+     * Legacy pre-3.3 (file_id + revision, no FK to files):
+     *   submission_artwork_files, submission_supplementary_files
+     *
+     * @var array<int, array{0:string,1:string}>
+     */
+    private const FILES_REFERENCER_TABLES = [
+        ['submission_files', 'file_id'],
+        ['submission_file_revisions', 'file_id'],
+    ];
+
     /** @var array<string, array{pk:?string, fk:?string}> */
     private array $tableMetaCache = [];
 
@@ -72,16 +90,52 @@ final class IlluminateDatabaseGateway
      */
     public function discoverSettingsTables(): array
     {
+        return $this->discoverTablesMatching('%\_settings', 'locale');
+    }
+
+    /**
+     * Every *_settings table present in the live schema (locale optional).
+     * Merges information_schema discovery with SettingsFkRegistry so orphan-only
+     * tables (event_log_settings, plugin_settings, …) are always considered.
+     *
+     * @return string[]
+     */
+    public function discoverAllSettingsTables(): array
+    {
+        $live = $this->discoverTablesMatching('%\_settings');
+        $registered = SettingsFkRegistry::allSettingsTables();
+        $names = [];
+        foreach (array_merge($live, $registered) as $table) {
+            if ($this->tableExists($table) && !SettingsFkRegistry::isExcluded($table)) {
+                $names[$table] = true;
+            }
+        }
+        return array_keys($names);
+    }
+
+    /**
+     * @return string[]
+     */
+    private function discoverTablesMatching(string $tablePattern, ?string $requiredColumn = null): array
+    {
         $db = $this->getDatabaseName();
         if ($db === '') {
             return [];
         }
         try {
-            $rows = Capsule::select(
-                'SELECT DISTINCT table_name AS name FROM information_schema.columns'
-                . ' WHERE table_schema = ? AND table_name LIKE ? AND column_name = ?',
-                [$db, '%\_settings', 'locale']
-            );
+            if ($requiredColumn === null) {
+                $rows = Capsule::select(
+                    'SELECT table_name AS name FROM information_schema.tables'
+                    . ' WHERE table_schema = ? AND table_name LIKE ? ORDER BY table_name',
+                    [$db, $tablePattern]
+                );
+            } else {
+                $rows = Capsule::select(
+                    'SELECT DISTINCT table_name AS name FROM information_schema.columns'
+                    . ' WHERE table_schema = ? AND table_name LIKE ? AND column_name = ?',
+                    [$db, $tablePattern, $requiredColumn]
+                );
+            }
         } catch (\Throwable $e) {
             return [];
         }
@@ -93,6 +147,34 @@ final class IlluminateDatabaseGateway
             }
         }
         return array_values(array_unique($names));
+    }
+
+    /**
+     * @return string[]
+     */
+    private function getTableColumns(string $table): array
+    {
+        $db = $this->getDatabaseName();
+        if ($db === '') {
+            return [];
+        }
+        try {
+            $rows = Capsule::select(
+                'SELECT column_name AS name FROM information_schema.columns'
+                . ' WHERE table_schema = ? AND table_name = ? ORDER BY ordinal_position',
+                [$db, $table]
+            );
+        } catch (\Throwable $e) {
+            return [];
+        }
+        $names = [];
+        foreach ($rows as $r) {
+            $name = is_object($r) ? (string) ($r->name ?? $r->NAME ?? '') : '';
+            if ($name !== '') {
+                $names[] = $name;
+            }
+        }
+        return $names;
     }
 
     /**
@@ -113,6 +195,50 @@ final class IlluminateDatabaseGateway
             return;
         }
         yield from $this->fetchOffenders($table, $settingNames, $meta);
+    }
+
+    /**
+     * Counts rows with empty/NULL locale on the given setting names.
+     */
+    public function countEmptyLocaleRows(string $table, array $settingNames): int
+    {
+        if (empty($settingNames) || !$this->tableExists($table)) {
+            return 0;
+        }
+        $meta = $this->getTableMeta($table);
+        if ($meta['pk'] === null) {
+            return 0;
+        }
+        try {
+            return (int) Capsule::table($table)
+                ->whereIn('setting_name', $settingNames)
+                ->where(function ($q) {
+                    $q->where('locale', '')->orWhereNull('locale');
+                })
+                ->count();
+        } catch (\Throwable $e) {
+            return 0;
+        }
+    }
+
+    /**
+     * Sets locale on all rows with empty/NULL locale for the given setting names.
+     */
+    public function fixEmptyLocales(string $table, array $settingNames, string $newLocale): int
+    {
+        if (empty($settingNames) || !$this->tableExists($table)) {
+            return 0;
+        }
+        try {
+            return (int) Capsule::table($table)
+                ->whereIn('setting_name', $settingNames)
+                ->where(function ($q) {
+                    $q->where('locale', '')->orWhereNull('locale');
+                })
+                ->update(['locale' => $newLocale]);
+        } catch (\Throwable $e) {
+            return 0;
+        }
     }
 
     /**
@@ -161,18 +287,18 @@ final class IlluminateDatabaseGateway
     }
 
     /**
-     * Resolves the foreign-key relationship for a settings table. Uses
-     * information_schema.key_column_usage first; falls back to naming
-     * conventions when the schema has no declared FK constraint.
+     * Resolves every foreign-key relationship for a settings table. Order:
+     * 1) declared DB constraints; 2) SettingsFkRegistry; 3) naming convention.
      *
      * @param string $settingsTable Settings table name
-     * @return array{column:string,parentTable:string,parentColumn:string}|null FK info, or null when unresolvable
+     * @return array<int, array{column:string,parentTable:string,parentColumn:string,ignoreZero?:bool}>
      */
-    public function getForeignKey(string $settingsTable): ?array
+    public function getForeignKeys(string $settingsTable): array
     {
-        if (!$this->tableExists($settingsTable)) {
-            return null;
+        if (!$this->tableExists($settingsTable) || SettingsFkRegistry::isExcluded($settingsTable)) {
+            return [];
         }
+
         $db = $this->getDatabaseName();
         if ($db !== '') {
             try {
@@ -180,34 +306,67 @@ final class IlluminateDatabaseGateway
                     'SELECT column_name AS col, referenced_table_name AS parent_table, referenced_column_name AS parent_col'
                     . ' FROM information_schema.key_column_usage'
                     . ' WHERE table_schema = ? AND table_name = ? AND referenced_table_name IS NOT NULL'
-                    . ' ORDER BY ordinal_position LIMIT 1',
+                    . ' ORDER BY ordinal_position',
                     [$db, $settingsTable]
                 );
+                $fromSchema = [];
                 foreach ($rows as $r) {
                     $col = is_object($r) ? (string) ($r->col ?? $r->COL ?? '') : '';
                     $parentTable = is_object($r) ? (string) ($r->parent_table ?? $r->PARENT_TABLE ?? '') : '';
                     $parentCol = is_object($r) ? (string) ($r->parent_col ?? $r->PARENT_COL ?? '') : '';
-
                     if ($col !== '' && $parentTable !== '' && $parentCol !== '') {
-                        return ['column' => $col, 'parentTable' => $parentTable, 'parentColumn' => $parentCol];
+                        $fromSchema[] = [
+                            'column' => $col,
+                            'parentTable' => $parentTable,
+                            'parentColumn' => $parentCol,
+                        ];
                     }
                 }
+                if (!empty($fromSchema)) {
+                    return $fromSchema;
+                }
             } catch (\Throwable $e) {
-                // fall through to convention
+                // fall through
             }
         }
+
+        $registryRules = SettingsFkRegistry::rulesFor($settingsTable);
+        $resolved = [];
+        foreach ($registryRules as $rule) {
+            if ($this->tableExists($rule['parentTable'])) {
+                $resolved[] = $rule;
+            }
+        }
+        if (!empty($resolved)) {
+            return $resolved;
+        }
+
         $meta = $this->getTableMeta($settingsTable);
         if ($meta['fk'] === null) {
-            return null;
+            return [];
         }
-        // The parent PK is conventionally named the same as the FK column
-        // (journals.journal_id, controlled_vocab_entries.controlled_vocab_entry_id).
         foreach ($this->guessParentTables($meta['fk']) as $parentTable) {
             if ($this->tableExists($parentTable)) {
-                return ['column' => $meta['fk'], 'parentTable' => $parentTable, 'parentColumn' => $meta['fk']];
+                return [[
+                    'column' => $meta['fk'],
+                    'parentTable' => $parentTable,
+                    'parentColumn' => $meta['fk'],
+                ]];
             }
         }
-        return null;
+        return [];
+    }
+
+    /**
+     * First resolvable FK for a settings table (backward-compatible helper).
+     *
+     * @param string $settingsTable Settings table name
+     * @return array{column:string,parentTable:string,parentColumn:string,ignoreZero?:bool}|null
+     */
+    public function getForeignKey(string $settingsTable): ?array
+    {
+        $keys = $this->getForeignKeys($settingsTable);
+        return empty($keys) ? null : $keys[0];
     }
 
     /**
@@ -218,32 +377,38 @@ final class IlluminateDatabaseGateway
      * @param string $fkCol FK column name
      * @param string $parentTable Parent (entity) table name
      * @param string $parentCol Parent PK column name
+     * @param bool $ignoreZero When true, FK value 0 is treated as site-wide scope, not an orphan
      * @return iterable<array{pk:mixed, fk:mixed, setting_name:string, locale:string|null, setting_value:string|null}>
      */
-    public function findOrphans(string $settingsTable, string $fkCol, string $parentTable, string $parentCol): iterable
-    {
-        if (!$this->tableExists($settingsTable) || !$this->tableExists($parentTable)) {
-            return;
-        }
+    public function findOrphans(
+        string $settingsTable,
+        string $fkCol,
+        string $parentTable,
+        string $parentCol,
+        bool $ignoreZero = false
+    ): iterable {
         $meta = $this->getTableMeta($settingsTable);
         if ($meta['pk'] === null) {
             return;
         }
         $pkCol = $meta['pk'];
+        $columns = $this->getTableColumns($settingsTable);
+        $select = ['s.' . $pkCol . ' as pk', 's.' . $fkCol . ' as fk'];
+        if (in_array('setting_name', $columns, true)) {
+            $select[] = 's.setting_name';
+        }
+        if (in_array('locale', $columns, true)) {
+            $select[] = 's.locale';
+        }
+        if (in_array('setting_value', $columns, true)) {
+            $select[] = 's.setting_value';
+        }
+        $query = $this->buildOrphanQuery($settingsTable, $fkCol, $parentTable, $parentCol, $ignoreZero);
+        if ($query === null) {
+            return;
+        }
         try {
-            $cursor = Capsule::table($settingsTable . ' as s')
-                ->leftJoin($parentTable . ' as p', 's.' . $fkCol, '=', 'p.' . $parentCol)
-                ->whereNull('p.' . $parentCol)
-                ->whereNotNull('s.' . $fkCol)
-                ->select([
-                    's.' . $pkCol . ' as pk',
-                    's.' . $fkCol . ' as fk',
-                    's.setting_name',
-                    's.locale',
-                    's.setting_value',
-                ])
-                ->orderBy('s.' . $pkCol)
-                ->cursor();
+            $cursor = $query->select($select)->orderBy('s.' . $pkCol)->cursor();
         } catch (\Throwable $e) {
             return;
         }
@@ -252,9 +417,80 @@ final class IlluminateDatabaseGateway
                 'pk' => $row->pk,
                 'fk' => $row->fk,
                 'setting_name' => (string) ($row->setting_name ?? ''),
-                'locale' => $row->locale,
-                'setting_value' => $row->setting_value,
+                'locale' => $row->locale ?? null,
+                'setting_value' => $row->setting_value ?? null,
             ];
+        }
+    }
+
+    /**
+     * Counts settings rows whose FK value has no matching parent (Pass C).
+     */
+    public function countOrphans(
+        string $settingsTable,
+        string $fkCol,
+        string $parentTable,
+        string $parentCol,
+        bool $ignoreZero = false
+    ): int {
+        $query = $this->buildOrphanQuery($settingsTable, $fkCol, $parentTable, $parentCol, $ignoreZero);
+        return $query === null ? 0 : (int) $query->count();
+    }
+
+    /**
+     * Deletes all orphan settings rows for one FK in a single statement.
+     */
+    public function deleteOrphanSettings(
+        string $settingsTable,
+        string $fkCol,
+        string $parentTable,
+        string $parentCol,
+        bool $ignoreZero = false
+    ): int {
+        if (!$this->tableExists($settingsTable) || !$this->tableExists($parentTable)) {
+            return 0;
+        }
+        $sql = 'DELETE s FROM `' . $settingsTable . '` AS s'
+            . ' LEFT JOIN `' . $parentTable . '` AS p ON s.`' . $fkCol . '` = p.`' . $parentCol . '`'
+            . ' WHERE p.`' . $parentCol . '` IS NULL AND s.`' . $fkCol . '` IS NOT NULL';
+        if ($ignoreZero) {
+            $sql .= ' AND s.`' . $fkCol . '` != 0';
+        }
+        try {
+            return (int) Capsule::affectingStatement($sql);
+        } catch (\Throwable $e) {
+            return 0;
+        }
+    }
+
+    /**
+     * @return \Illuminate\Database\Query\Builder|null
+     */
+    private function buildOrphanQuery(
+        string $settingsTable,
+        string $fkCol,
+        string $parentTable,
+        string $parentCol,
+        bool $ignoreZero
+    ) {
+        if (!$this->tableExists($settingsTable) || !$this->tableExists($parentTable)) {
+            return null;
+        }
+        $meta = $this->getTableMeta($settingsTable);
+        if ($meta['pk'] === null) {
+            return null;
+        }
+        try {
+            $query = Capsule::table($settingsTable . ' as s')
+                ->leftJoin($parentTable . ' as p', 's.' . $fkCol, '=', 'p.' . $parentCol)
+                ->whereNull('p.' . $parentCol)
+                ->whereNotNull('s.' . $fkCol);
+            if ($ignoreZero) {
+                $query->where('s.' . $fkCol, '!=', 0);
+            }
+            return $query;
+        } catch (\Throwable $e) {
+            return null;
         }
     }
 
@@ -324,6 +560,18 @@ final class IlluminateDatabaseGateway
         }
     }
 
+    public function countRowsWithNullColumn(string $table, string $column): int
+    {
+        if (!$this->tableExists($table)) {
+            return 0;
+        }
+        try {
+            return (int) Capsule::table($table)->whereNull($column)->count();
+        } catch (\Throwable $e) {
+            return 0;
+        }
+    }
+
     /**
      * Yields rows from a *_settings table where setting_value IS NULL
      * (Pass D2 — NULL setting_value).
@@ -363,6 +611,104 @@ final class IlluminateDatabaseGateway
                 'locale' => $row->locale,
                 'setting_value' => $row->setting_value,
             ];
+        }
+    }
+
+    public function countRowsWithNullSettingValue(string $table): int
+    {
+        if (!$this->tableExists($table)) {
+            return 0;
+        }
+        try {
+            return (int) Capsule::table($table)->whereNull('setting_value')->count();
+        } catch (\Throwable $e) {
+            return 0;
+        }
+    }
+
+    /**
+     * Returns publication_settings rows whose issueId value does not match
+     * any live issues.issue_id. Matches OJS 3.4 PreflightCheckMigration.
+     *
+     * @return \Generator<int, array{publication_id:int|string, submission_id:int|string, setting_value:string, locale:?string}>
+     */
+    public function findInvalidPublicationIssueIdSettings(): \Generator
+    {
+        if (!$this->tableExists('publication_settings')
+            || !$this->tableExists('publications')
+            || !$this->tableExists('issues')
+        ) {
+            return;
+        }
+        if (!$this->columnExists('publication_settings', 'setting_name')
+            || !$this->columnExists('publication_settings', 'setting_value')
+        ) {
+            return;
+        }
+
+        try {
+            $cursor = Capsule::table('publications as p')
+                ->join('publication_settings as ps', 'ps.publication_id', '=', 'p.publication_id')
+                ->leftJoin('issues as i', Capsule::raw('CAST(i.issue_id AS CHAR(20))'), '=', 'ps.setting_value')
+                ->where('ps.setting_name', 'issueId')
+                ->whereNull('i.issue_id')
+                ->select([
+                    'p.publication_id as publication_id',
+                    'p.submission_id as submission_id',
+                    'ps.setting_value as setting_value',
+                    'ps.locale as locale',
+                ])
+                ->cursor();
+        } catch (\Throwable $e) {
+            return;
+        }
+
+        foreach ($cursor as $row) {
+            yield [
+                'publication_id' => $row->publication_id,
+                'submission_id' => $row->submission_id,
+                'setting_value' => (string) ($row->setting_value ?? ''),
+                'locale' => $row->locale ?? null,
+            ];
+        }
+    }
+
+    public function countInvalidPublicationIssueIdSettings(): int
+    {
+        if (!$this->tableExists('publication_settings')
+            || !$this->tableExists('publications')
+            || !$this->tableExists('issues')
+        ) {
+            return 0;
+        }
+        try {
+            return (int) Capsule::table('publications as p')
+                ->join('publication_settings as ps', 'ps.publication_id', '=', 'p.publication_id')
+                ->leftJoin('issues as i', Capsule::raw('CAST(i.issue_id AS CHAR(20))'), '=', 'ps.setting_value')
+                ->where('ps.setting_name', 'issueId')
+                ->whereNull('i.issue_id')
+                ->count();
+        } catch (\Throwable $e) {
+            return 0;
+        }
+    }
+
+    public function deleteInvalidPublicationIssueIdSettings(): int
+    {
+        if (!$this->tableExists('publication_settings')
+            || !$this->tableExists('publications')
+            || !$this->tableExists('issues')
+        ) {
+            return 0;
+        }
+        $sql = 'DELETE ps FROM `publication_settings` AS ps'
+            . ' INNER JOIN `publications` AS p ON ps.`publication_id` = p.`publication_id`'
+            . ' LEFT JOIN `issues` AS i ON CAST(i.`issue_id` AS CHAR(20)) = ps.`setting_value`'
+            . " WHERE ps.`setting_name` = 'issueId' AND i.`issue_id` IS NULL";
+        try {
+            return (int) Capsule::affectingStatement($sql);
+        } catch (\Throwable $e) {
+            return 0;
         }
     }
 
@@ -660,6 +1006,40 @@ final class IlluminateDatabaseGateway
         }
     }
 
+    public function countReviewRevisionFiles(): int
+    {
+        if (!$this->tableExists('submission_files')) {
+            return 0;
+        }
+        try {
+            return (int) Capsule::table('submission_files')->where('file_stage', '=', 15)->count();
+        } catch (\Throwable $e) {
+            return 0;
+        }
+    }
+
+    /**
+     * Deletes every submission_file stuck in REVIEW_REVISION status.
+     */
+    public function deleteAllReviewRevisionFiles(): int
+    {
+        if (!$this->tableExists('submission_files')) {
+            return 0;
+        }
+        $deleted = 0;
+        try {
+            $ids = Capsule::table('submission_files')
+                ->where('file_stage', '=', 15)
+                ->pluck('submission_file_id');
+        } catch (\Throwable $e) {
+            return 0;
+        }
+        foreach ($ids as $id) {
+            $deleted += $this->deleteReviewRevisionFile($id);
+        }
+        return $deleted;
+    }
+
     /**
      * Cascade-deletes a submission_file row stuck in REVIEW_REVISION status
      * along with its revisions, settings, review-round associations, review
@@ -869,6 +1249,304 @@ final class IlluminateDatabaseGateway
     }
 
     /**
+     * Counts rows for a cascade step by joining back to the journal root.
+     *
+     * @param array<string, array{table:string, identity:string, source:string, column:string, parent:?string, assocType:?int, via:string, aggregate:bool}> $planByTable
+     * @param array<int> $deadJournalIds
+     */
+    public function countRowsByDeadJournalPath(array $step, array $planByTable, array $deadJournalIds): int
+    {
+        if (empty($deadJournalIds) || ($step['parent'] ?? null) === null) {
+            return 0;
+        }
+
+        $path = $this->buildDeadJournalCascadePath($step, $planByTable);
+        if ($path === null) {
+            return 0;
+        }
+        $root = $path[0];
+        if (!$this->tableExists($root['table']) || !$this->tableExists($step['table'])) {
+            return 0;
+        }
+        try {
+            $query = Capsule::table($root['table'] . ' as t0');
+            for ($i = 1; $i < count($path); $i++) {
+                $parent = $path[$i - 1];
+                $child = $path[$i];
+                if (!$this->columnExists($parent['table'], $parent['identity'])
+                    || !$this->columnExists($child['table'], $child['column'])) {
+                    return 0;
+                }
+                $query->join(
+                    $child['table'] . ' as t' . $i,
+                    't' . ($i - 1) . '.' . $parent['identity'],
+                    '=',
+                    't' . $i . '.' . $child['column']
+                );
+                if ($child['assocType'] !== null) {
+                    $query->where('t' . $i . '.assoc_type', $child['assocType']);
+                }
+            }
+
+            $query->whereIn('t0.' . $root['column'], $deadJournalIds);
+            if ($root['assocType'] !== null) {
+                $query->where('t0.assoc_type', $root['assocType']);
+            }
+
+            return (int) $query->count();
+        } catch (\Throwable $e) {
+            return 0;
+        }
+    }
+
+    /**
+     * @param array<string, array{table:string, identity:string, source:string, column:string, parent:?string, assocType:?int, via:string, aggregate:bool}> $planByTable
+     * @return array<int, array{table:string, identity:string, source:string, column:string, parent:?string, assocType:?int, via:string, aggregate:bool}>|null
+     */
+    private function buildDeadJournalCascadePath(array $step, array $planByTable): ?array
+    {
+        if (($step['parent'] ?? null) === null) {
+            return null;
+        }
+        $path = [];
+        $current = $step;
+        while (true) {
+            array_unshift($path, $current);
+            if ($current['parent'] === null) {
+                break;
+            }
+            if (!isset($planByTable[$current['parent']])) {
+                return null;
+            }
+            $current = $planByTable[$current['parent']];
+        }
+        return $path;
+    }
+
+    /**
+     * Deletes rows for one cascade step scoped to a single dead journal.
+     *
+     * @param array<string, array{table:string, identity:string, source:string, column:string, parent:?string, assocType:?int, via:string, aggregate:bool}> $planByTable
+     */
+    public function deleteRowsByDeadJournalPath(array $step, array $planByTable, int $journalId): int
+    {
+        if ($step['source'] === 'journal') {
+            return $this->deleteRowsByColumn(
+                $step['table'],
+                $step['column'],
+                [$journalId],
+                $step['assocType']
+            );
+        }
+
+        $path = $this->buildDeadJournalCascadePath($step, $planByTable);
+        if ($path === null || !$this->tableExists($step['table'])) {
+            return 0;
+        }
+
+        $leafIdx = count($path) - 1;
+        $leafAlias = 't' . $leafIdx;
+        $root = $path[0];
+
+        try {
+            $sql = 'DELETE ' . $leafAlias . ' FROM `' . $path[$leafIdx]['table'] . '` AS ' . $leafAlias;
+            for ($i = $leafIdx; $i >= 1; $i--) {
+                $parent = $path[$i - 1];
+                $child = $path[$i];
+                if (!$this->columnExists($parent['table'], $parent['identity'])
+                    || !$this->columnExists($child['table'], $child['column'])) {
+                    return 0;
+                }
+                $sql .= ' INNER JOIN `' . $parent['table'] . '` AS t' . ($i - 1)
+                    . ' ON t' . ($i - 1) . '.`' . $parent['identity'] . '` = t' . $i . '.`' . $child['column'] . '`';
+            }
+            $sql .= ' WHERE t0.`' . $root['column'] . '` = ' . (int) $journalId;
+            if ($root['assocType'] !== null) {
+                $sql .= ' AND t0.`assoc_type` = ' . (int) $root['assocType'];
+            }
+            if ($step['assocType'] !== null && $leafIdx > 0) {
+                $sql .= ' AND ' . $leafAlias . '.`assoc_type` = ' . (int) $step['assocType'];
+            }
+            return (int) Capsule::affectingStatement($sql);
+        } catch (\Throwable $e) {
+            return 0;
+        }
+    }
+
+    public function deleteSubmissionFileDependentsForJournal(int $journalId): int
+    {
+        if (!$this->tableExists('submission_files') || !$this->tableExists('submissions')) {
+            return 0;
+        }
+        try {
+            $fileIds = Capsule::table('submission_files as sf')
+                ->join('submissions as s', 's.submission_id', '=', 'sf.submission_id')
+                ->where('s.context_id', '=', $journalId)
+                ->pluck('sf.submission_file_id');
+        } catch (\Throwable $e) {
+            return 0;
+        }
+        if ($fileIds->isEmpty()) {
+            return 0;
+        }
+        $deleted = 0;
+        foreach (['review_round_files', 'review_files', 'publication_galleys'] as $table) {
+            if ($this->tableExists($table) && $this->columnExists($table, 'submission_file_id')) {
+                foreach (array_chunk($fileIds->all(), self::ID_CHUNK) as $chunk) {
+                    $deleted += (int) Capsule::table($table)->whereIn('submission_file_id', $chunk)->delete();
+                }
+            }
+        }
+        return $deleted;
+    }
+
+    public function registerJournalCascadeScope(array &$scopeByTable, string $table, array $step, int $journalId): void
+    {
+        $this->registerJournalCascadeScopeForDeadJournals($scopeByTable, $table, $step, [$journalId]);
+    }
+
+    /**
+     * @param array<int> $deadJournalIds
+     * @param array<string, callable(): \Illuminate\Database\Query\Builder> $scopeByTable
+     */
+    public function registerJournalCascadeScopeForDeadJournals(
+        array &$scopeByTable,
+        string $table,
+        array $step,
+        array $deadJournalIds
+    ): void {
+        if (empty($deadJournalIds)) {
+            return;
+        }
+        $identity = $step['identity'];
+        $column = $step['column'];
+        $assocType = $step['assocType'];
+        $scopeByTable[$table] = function () use ($table, $identity, $column, $deadJournalIds, $assocType) {
+            $q = Capsule::table($table)->select($identity)->whereIn($column, $deadJournalIds);
+            if ($assocType !== null) {
+                $q->where('assoc_type', $assocType);
+            }
+            return $q;
+        };
+    }
+
+    /**
+     * @param array<string, callable(): \Illuminate\Database\Query\Builder> $scopeByTable
+     */
+    public function countRowsByCascadeScope(string $table, array $step, array &$scopeByTable): int
+    {
+        $parent = $step['parent'];
+        if ($parent === null || !isset($scopeByTable[$parent]) || !$this->tableExists($table)) {
+            return 0;
+        }
+        try {
+            $query = Capsule::table($table)->whereIn($step['column'], $scopeByTable[$parent]());
+            if ($step['assocType'] !== null) {
+                $query->where('assoc_type', $step['assocType']);
+            }
+            $count = (int) $query->count();
+        } catch (\Throwable $e) {
+            return 0;
+        }
+        if ($count > 0 && $this->columnExists($table, $step['identity'])) {
+            $identity = $step['identity'];
+            $column = $step['column'];
+            $assocType = $step['assocType'];
+            $scopeByTable[$table] = function () use ($table, $identity, $column, &$scopeByTable, $parent, $assocType) {
+                $q = Capsule::table($table)->select($identity)->whereIn($column, $scopeByTable[$parent]());
+                if ($assocType !== null) {
+                    $q->where('assoc_type', $assocType);
+                }
+                return $q;
+            };
+        }
+        return $count;
+    }
+
+    /**
+     * Counts rows for one journal-cascade step using nested subqueries so
+     * Pass F never loads millions of parent ids into PHP.
+     *
+     * @param array<string, callable(): \Illuminate\Database\Query\Builder> $scopeByTable
+     * @deprecated Use registerJournalCascadeScope + countRowsByCascadeScope from Scanner
+     */
+    public function countRowsForJournalCascadeStep(array $step, int $journalId, array &$scopeByTable): int
+    {
+        $table = $step['table'];
+        if (!$this->tableExists($table) || !$this->columnExists($table, $step['column'])) {
+            return 0;
+        }
+
+        if ($step['source'] === 'journal') {
+            if (!empty($step['aggregate'])) {
+                return $this->countRowsByColumn(
+                    $table,
+                    $step['column'],
+                    [$journalId],
+                    $step['assocType']
+                );
+            }
+            if (!$this->columnExists($table, $step['identity'])) {
+                return 0;
+            }
+            try {
+                $query = Capsule::table($table)->where($step['column'], $journalId);
+                if ($step['assocType'] !== null) {
+                    $query->where('assoc_type', $step['assocType']);
+                }
+                $count = (int) $query->count();
+            } catch (\Throwable $e) {
+                return 0;
+            }
+            if ($count === 0) {
+                return 0;
+            }
+            $identity = $step['identity'];
+            $column = $step['column'];
+            $assocType = $step['assocType'];
+            $scopeByTable[$table] = function () use ($table, $identity, $column, $journalId, $assocType) {
+                $q = Capsule::table($table)->select($identity)->where($column, $journalId);
+                if ($assocType !== null) {
+                    $q->where('assoc_type', $assocType);
+                }
+                return $q;
+            };
+            return $count;
+        }
+
+        $parent = $step['parent'];
+        if ($parent === null || !isset($scopeByTable[$parent]) || !$this->columnExists($table, $step['identity'])) {
+            return 0;
+        }
+
+        try {
+            $parentSub = $scopeByTable[$parent]();
+            $query = Capsule::table($table)->whereIn($step['column'], $parentSub);
+            if ($step['assocType'] !== null) {
+                $query->where('assoc_type', $step['assocType']);
+            }
+            $count = (int) $query->count();
+        } catch (\Throwable $e) {
+            return 0;
+        }
+        if ($count === 0) {
+            return 0;
+        }
+
+        $identity = $step['identity'];
+        $column = $step['column'];
+        $assocType = $step['assocType'];
+        $scopeByTable[$table] = function () use ($table, $identity, $column, &$scopeByTable, $parent, $assocType) {
+            $q = Capsule::table($table)->select($identity)->whereIn($column, $scopeByTable[$parent]());
+            if ($assocType !== null) {
+                $q->where('assoc_type', $assocType);
+            }
+            return $q;
+        };
+        return $count;
+    }
+
+    /**
      * Deletes rows whose $column matches any of $values, in chunks.
      * WRITES to the database.
      *
@@ -892,6 +1570,157 @@ final class IlluminateDatabaseGateway
             $deleted += (int) $query->delete();
         }
         return $deleted;
+    }
+
+    /**
+     * Deletes rows that FK to submission_files.submission_file_id. Required when
+     * the DB has FK constraints and those tables are not removed via review_round_id.
+     *
+     * @param array<int, int|string> $submissionIds
+     */
+    public function deleteSubmissionFileDependents(array $submissionIds): int
+    {
+        if (empty($submissionIds) || !$this->tableExists('submission_files')) {
+            return 0;
+        }
+
+        $fileIds = [];
+        foreach (array_chunk(array_values($submissionIds), self::ID_CHUNK) as $chunk) {
+            try {
+                foreach (Capsule::table('submission_files')
+                    ->whereIn('submission_id', $chunk)
+                    ->pluck('submission_file_id') as $id) {
+                    if ($id !== null) {
+                        $fileIds[(string) $id] = $id;
+                    }
+                }
+            } catch (\Throwable $e) {
+                return 0;
+            }
+        }
+        if (empty($fileIds)) {
+            return 0;
+        }
+
+        $deleted = 0;
+        foreach (['review_round_files', 'review_files', 'publication_galleys'] as $table) {
+            if ($this->tableExists($table) && $this->columnExists($table, 'submission_file_id')) {
+                $deleted += $this->deleteRowsByColumn($table, 'submission_file_id', array_values($fileIds));
+            }
+        }
+        return $deleted;
+    }
+
+    /**
+     * Counts rows in `files` that are not referenced by submission_files or
+     * submission_file_revisions (Pass C — unreferenced blob orphans).
+     */
+    public function countUnreferencedFiles(): int
+    {
+        if (!$this->tableExists('files') || !$this->tableExists('submission_files')) {
+            return 0;
+        }
+        try {
+            $query = Capsule::table('files as f');
+            $this->applyUnreferencedFilesScope($query);
+            return (int) $query->count();
+        } catch (\Throwable $e) {
+            return 0;
+        }
+    }
+
+    /**
+     * Yields file_id for every unreferenced blob row in `files`.
+     *
+     * @return \Generator<int, int|string>
+     */
+    public function findUnreferencedFileIds(): \Generator
+    {
+        if (!$this->tableExists('files') || !$this->tableExists('submission_files')) {
+            return;
+        }
+        try {
+            $query = Capsule::table('files as f')
+                ->select('f.file_id')
+                ->orderBy('f.file_id');
+            $this->applyUnreferencedFilesScope($query);
+            $cursor = $query->cursor();
+        } catch (\Throwable $e) {
+            return;
+        }
+        foreach ($cursor as $row) {
+            yield $row->file_id;
+        }
+    }
+
+    /**
+     * Deletes one unreferenced blob via the OJS file service when possible,
+     * falling back to removing the DB row only.
+     *
+     * @param int|string $fileId
+     */
+    public function deleteUnreferencedFile($fileId): int
+    {
+        if (!$this->tableExists('files') || $this->isFileReferenced($fileId)) {
+            return 0;
+        }
+        try {
+            \Services::get('file')->delete($fileId);
+            return 1;
+        } catch (\Throwable $e) {
+            return (int) Capsule::table('files')->where('file_id', $fileId)->delete();
+        }
+    }
+
+    /**
+     * Deletes every unreferenced blob in `files`, re-checking references
+     * before each delete so live-journal rows are never removed.
+     */
+    public function deleteUnreferencedFiles(): int
+    {
+        $deleted = 0;
+        foreach ($this->findUnreferencedFileIds() as $fileId) {
+            $deleted += $this->deleteUnreferencedFile($fileId);
+        }
+        return $deleted;
+    }
+
+    /**
+     * True when any submission_files or submission_file_revisions row still
+     * points at this file_id.
+     *
+     * @param int|string $fileId
+     */
+    public function isFileReferenced($fileId): bool
+    {
+        foreach (self::FILES_REFERENCER_TABLES as [$table, $column]) {
+            if (!$this->tableExists($table)) {
+                continue;
+            }
+            if (Capsule::table($table)->where($column, $fileId)->exists()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Restricts a query on alias `f` (files) to rows with no referencers.
+     *
+     * @param \Illuminate\Database\Query\Builder $query
+     */
+    private function applyUnreferencedFilesScope($query): void
+    {
+        foreach (self::FILES_REFERENCER_TABLES as [$table, $column]) {
+            if (!$this->tableExists($table)) {
+                continue;
+            }
+            $query->whereNotExists(function ($q) use ($table, $column) {
+                $q->select(Capsule::raw(1))
+                    ->from("{$table} as ref")
+                    ->whereColumn("ref.{$column}", 'f.file_id');
+            });
+        }
     }
 
     /**

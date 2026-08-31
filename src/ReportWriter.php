@@ -18,8 +18,6 @@ namespace APP\tools\settingsHealthCheck\src;
 
 final class ReportWriter
 {
-    // ── ANSI terminal colors ──────────────────────────────────────────────
-
     private const C_RESET  = "\033[0m";
     private const C_BOLD   = "\033[1m";
     private const C_DIM    = "\033[2m";
@@ -71,14 +69,8 @@ final class ReportWriter
      */
     public function computeStats(array $findings): int
     {
-        $total = 0;
-        foreach ($findings as $finding) {
-            $total += $finding->rowCount;
-        }
-        return $total;
+        return $this->sumRowCounts($findings);
     }
-
-    // ── Scenario definitions ──────────────────────────────────────────────
 
     /**
      * Each scenario maps a menu number to one or more Finding reason codes.
@@ -86,36 +78,33 @@ final class ReportWriter
      */
     private const SCENARIOS = [
         1 => [
-            'label'   => 'Missing locale (schema-driven)',
-            'reasons' => [Finding::REASON_SCHEMA_MISSING_LOCALE],
+            'label'   => 'Bad locale tags',
+            'reasons' => [
+                Finding::REASON_SCHEMA_MISSING_LOCALE,
+                Finding::REASON_HEURISTIC_LOCALE_MISMATCH,
+            ],
         ],
         2 => [
-            'label'   => 'Missing locale (heuristic)',
-            'reasons' => [Finding::REASON_HEURISTIC_LOCALE_MISMATCH],
-        ],
-        3 => [
-            'label'   => 'Orphaned settings',
+            'label'   => 'Orphaned settings, entities & files',
             'reasons' => [Finding::REASON_ORPHAN_ENTITY],
         ],
-        4 => [
+        3 => [
             'label'   => 'Required fields NULL',
             'reasons' => [Finding::REASON_REQUIRED_NULL],
         ],
-        5 => [
+        4 => [
             'label'   => 'NULL setting_value',
             'reasons' => [Finding::REASON_SETTING_VALUE_NULL],
         ],
-        6 => [
+        5 => [
             'label'   => 'REVIEW_REVISION files',
             'reasons' => [Finding::REASON_REVIEW_REVISION],
         ],
-        7 => [
+        6 => [
             'label'   => 'Deleted journal leftovers',
             'reasons' => [Finding::REASON_DELETED_JOURNAL],
         ],
     ];
-
-    // ── Public entry point ────────────────────────────────────────────────
 
     /**
      * Prints the interactive report: summary table then a drill-down loop.
@@ -123,35 +112,34 @@ final class ReportWriter
      * and exits without entering the interactive loop.
      *
      * @param array{findings?:Finding[],tableResults?:array<string,array{orphanFk?:?string}>,entityResults?:array<string,array{pk?:?string}>} $context
+     * @return bool True when the user chose to apply fixes (only possible with $fixEnabled)
      */
-    public function renderInteractive(array $context): void
+    public function renderInteractive(array $context, bool $fixEnabled = false): bool
     {
         $findings = $context['findings'] ?? [];
 
         if (empty($findings)) {
             echo "\n  " . self::color('No findings — database looks clean.', 'green') . "\n\n";
-            return;
+            return false;
         }
 
         $tableResults = $context['tableResults'] ?? [];
         $entityResults = $context['entityResults'] ?? [];
 
-        // Group findings into scenario buckets.
         $buckets = $this->buildBuckets($findings);
-
-        // Always print the summary table.
         $this->renderSummaryTable($buckets, $this->sumRowCounts($findings));
 
-        // Only enter interactive loop when STDIN is a real terminal.
-        if (!(function_exists('stream_isatty') && stream_isatty(STDIN))) {
-            echo "\n";
-            return;
+        if ($fixEnabled) {
+            echo "\n  " . self::color('--fix: press [f] in the menu to apply fixes, or [q] to exit without changes.', 'yellow') . "\n";
         }
 
-        $this->interactiveLoop($buckets, $tableResults, $entityResults);
-    }
+        if (!(function_exists('stream_isatty') && stream_isatty(STDIN))) {
+            echo "\n";
+            return false;
+        }
 
-    // ── Bucket helpers ────────────────────────────────────────────────────
+        return $this->interactiveLoop($buckets, $tableResults, $entityResults, $fixEnabled);
+    }
 
     /**
      * Groups findings by scenario number. Each bucket is
@@ -199,11 +187,7 @@ final class ReportWriter
      */
     private function bucketRecordCount(array $bucket): int
     {
-        $total = 0;
-        foreach ($bucket['findings'] as $finding) {
-            $total += $finding->rowCount;
-        }
-        return $total;
+        return $this->sumRowCounts($bucket['findings']);
     }
 
     /**
@@ -218,8 +202,6 @@ final class ReportWriter
         }
         return null;
     }
-
-    // ── Summary table ─────────────────────────────────────────────────────
 
     /**
      * Prints the compact summary table with per-scenario counts.
@@ -238,11 +220,9 @@ final class ReportWriter
             }
         }
 
-        // Table layout: 4 cols — #, Scenario, Tables, Records
-        // Widths: 3 + 36 + 9 + 10 = 58 → use 60 for good measure
-        $wLabel  = 38;  // scenario label
-        $wTables = 8;   // table count
-        $wRecs   = 8;   // record count
+        $wLabel  = 38;
+        $wTables = 8;
+        $wRecs   = 8;
 
         $sepTop    = '┌' . str_repeat('─', $wLabel + $wTables + $wRecs + 10) . '┐';
         $sepHead   = '├' . str_repeat('─', $wLabel + $wTables + $wRecs + 10) . '┤';
@@ -255,7 +235,6 @@ final class ReportWriter
         echo $c('│' . str_repeat(' ', $pad) . $title . str_repeat(' ', mb_strlen($sepTop) - 2 - $pad - mb_strlen($title)) . '│', 'bold|cyan') . "\n";
         echo $c($sepHead, 'cyan') . "\n";
 
-        // Header row
         $hNum  = '  #';
         $hScen = '  Scenario';
         $hTab  = 'Tables';
@@ -269,7 +248,6 @@ final class ReportWriter
         ) . "\n";
         echo $c($sepHead, 'cyan') . "\n";
 
-        // Data rows
         foreach ($buckets as $n => $bucket) {
             $count  = $this->bucketRecordCount($bucket);
             $tables = count($bucket['tables']);
@@ -291,41 +269,74 @@ final class ReportWriter
             }
         }
 
-        // Footer
         echo $c($sepBottom, 'cyan') . "\n";
         $footer = "Total: {$total} finding" . ($total === 1 ? '' : 's') .
                    " across {$scenariosWithFindings} scenario" . ($scenariosWithFindings === 1 ? '' : 's');
         echo '  ' . $c($footer, 'bold') . "\n\n";
     }
 
-    // ── Interactive loop ──────────────────────────────────────────────────
+    /**
+     * Sums rowCount across all scenario buckets.
+     *
+     * @param array<int, array{findings:Finding[]}> $buckets
+     */
+    private function totalFromBuckets(array $buckets): int
+    {
+        $total = 0;
+        foreach ($buckets as $bucket) {
+            $total += $this->bucketRecordCount($bucket);
+        }
+        return $total;
+    }
 
     /**
-     * Reads from STDIN: number (1-7) drills into scenario detail,
+     * Reads from STDIN: scenario number drills into scenario detail,
      * 'q' / 'Q' quits. Re-prompts on invalid input.
      *
      * @param array<int, array{findings:Finding[],tables:array<string,int>}> $buckets
      * @param array<string, array{orphanFk?:?string}> $tableResults
      * @param array<string, array{pk?:?string}> $entityResults
      */
-    private function interactiveLoop(array $buckets, array $tableResults, array $entityResults): void
+    private function interactiveLoop(array $buckets, array $tableResults, array $entityResults, bool $fixEnabled = false): bool
     {
         $c = fn(string $t, string $clr) => self::color($t, $clr);
+        $showSummary = false;
+        $maxScenario = count(self::SCENARIOS);
+        $menuPrompt = $fixEnabled
+            ? '  Enter [1-' . $maxScenario . '] for details, [f] apply fixes, [q] quit without fixing: '
+            : '  Enter [1-' . $maxScenario . '] for details, [q] to quit: ';
+        $invalidPrompt = $fixEnabled
+            ? 'Invalid choice. Enter 1–' . $maxScenario . ', "f", or "q".'
+            : 'Invalid choice. Enter 1–' . $maxScenario . ' or "q".';
 
         while (true) {
-            echo $c('  Enter [1-7] to see details, [q] to quit: ', 'bold');
+            if ($showSummary) {
+                $this->renderSummaryTable($buckets, $this->totalFromBuckets($buckets));
+            }
+            $showSummary = true;
+
+            echo $c($menuPrompt, 'bold');
 
             $input = strtolower(trim(fgets(STDIN)));
             echo "\n";
 
             if ($input === 'q') {
-                echo '  ' . $c('Done.', 'green') . "\n\n";
-                break;
+                echo '  ' . $c('Done — no fixes applied.', 'green') . "\n\n";
+                return false;
+            }
+
+            if ($input === 'f') {
+                if (!$fixEnabled) {
+                    echo '  ' . $c($invalidPrompt, 'yellow') . "\n\n";
+                    continue;
+                }
+                echo '  ' . $c('Applying fixes...', 'bold|green') . "\n\n";
+                return true;
             }
 
             $n = (int)$input;
-            if ($n < 1 || $n > 7) {
-                echo '  ' . $c('Invalid choice. Enter a number 1–7 or "q".', 'yellow') . "\n\n";
+            if ($n < 1 || $n > $maxScenario) {
+                echo '  ' . $c($invalidPrompt, 'yellow') . "\n\n";
                 continue;
             }
 
@@ -336,13 +347,27 @@ final class ReportWriter
 
             $this->renderScenarioDetail($n, $buckets[$n]['findings'], $tableResults, $entityResults);
 
-            // Post-detail prompt
+            $detailPrompt = $fixEnabled
+                ? '  [Enter] menu  |  [s] save  |  [f] apply fixes  |  [q] quit without fixing: '
+                : '  [Enter] menu  |  [s] save to file  |  [q] quit: ';
+            $detailInvalid = $fixEnabled
+                ? 'Press Enter, "s", "f", or "q".'
+                : 'Press Enter, "s", or "q".';
+
             while (true) {
-                echo "\n" . $c('  [Enter] menu  |  [s] save to file  |  [q] quit: ', 'bold');
+                echo "\n" . $c($detailPrompt, 'bold');
                 $input2 = strtolower(trim(fgets(STDIN)));
                 if ($input2 === 'q') {
-                    echo "\n  " . $c('Done.', 'green') . "\n\n";
-                    return;
+                    echo "\n  " . $c('Done — no fixes applied.', 'green') . "\n\n";
+                    return false;
+                }
+                if ($input2 === 'f') {
+                    if (!$fixEnabled) {
+                        echo '  ' . $c($detailInvalid, 'yellow') . "\n";
+                        continue;
+                    }
+                    echo "\n  " . $c('Applying fixes...', 'bold|green') . "\n\n";
+                    return true;
                 }
                 if ($input2 === '') {
                     echo "\n";
@@ -357,18 +382,16 @@ final class ReportWriter
                     }
                     continue;
                 }
-                echo '  ' . $c('Press Enter, "s", or "q".', 'yellow') . "\n";
+                echo '  ' . $c($detailInvalid, 'yellow') . "\n";
             }
         }
     }
-
-    // ── Scenario detail ───────────────────────────────────────────────────
 
     /**
      * Prints every finding for a single scenario, grouped by table.
      * No row cap — user explicitly asked for full detail.
      *
-     * @param int $scenario Scenario number (1-7)
+     * @param int $scenario Scenario number
      * @param Finding[] $findings All findings for this scenario
      * @param array<string, array{orphanFk?:?string}> $tableResults
      * @param array<string, array{pk?:?string}> $entityResults
@@ -381,13 +404,7 @@ final class ReportWriter
         $label = self::SCENARIOS[$scenario]['label'];
         $total = $this->sumRowCounts($findings);
 
-        // Group by table
-        $byTable = [];
-        foreach ($findings as $f) {
-            $byTable[$f->table][] = $f;
-        }
-        ksort($byTable);
-
+        $byTable = $this->groupFindingsByTable($findings);
         $nTables = count($byTable);
 
         echo $c($sep, 'cyan') . "\n";
@@ -398,159 +415,56 @@ final class ReportWriter
         foreach ($byTable as $table => $rows) {
             $rowCount = $this->sumRowCounts($rows);
             $fkInfo = $this->parseFk($tableResults[$table]['orphanFk'] ?? null);
-            $entityLabel = $fkInfo['column'] ?? 'entity_id';
-            $parentTable = $fkInfo['parentTable'] ?? null;
 
             echo '  ' . $c("▸ {$table}", 'bold|magenta') .
                  $c("  ({$rowCount} record" . ($rowCount === 1 ? ')' : 's)'), 'dim') . "\n\n";
 
             foreach ($rows as $f) {
-                $entity = $f->entityId === null ? '(unknown)' : (string)$f->entityId;
-                $label = $entityLabel;
-                if ($f->reason === Finding::REASON_DELETED_JOURNAL) {
-                    // entityId carries the dead journal id, not this table's FK value
-                    $label = 'journal_id';
-                } elseif ($f->reason === Finding::REASON_REVIEW_REVISION) {
-                    // entityId carries the submission id, not a settings FK
-                    $label = 'submission_id';
-                } elseif ($f->reason === Finding::REASON_REQUIRED_NULL) {
-                    // entityId is the row's own pk — name it after the table's pk column
-                    $label = $entityResults[$f->table]['pk'] ?? 'entity_id';
+                foreach ($this->findingDetailLines(
+                    $f,
+                    $fkInfo['column'] ?? 'entity_id',
+                    $fkInfo['parentTable'] ?? null,
+                    $entityResults
+                ) as $line) {
+                    echo $line === '' ? "\n" : $line . "\n";
                 }
-                $rowLabel = $f->rowCount > 1
-                    ? 'Journal #' . $f->pk . ' (' . number_format($f->rowCount) . ' rows)'
-                    : 'Row #' . $f->pk;
-                echo sprintf('    %-12s %s', $c($rowLabel, 'bold'), $c("({$label} = {$entity})", 'dim')) . "\n";
-                echo '      ' . $c('Problem', 'red') . ' : ' . $this->describeReason($f, $parentTable) . "\n";
-
-                if ($f->reason === Finding::REASON_REQUIRED_NULL) {
-                    echo '      ' . $c('Column', 'cyan') . '  : ' . $f->settingName .
-                         $c('  (declared required, currently NULL)', 'dim') . "\n";
-                } elseif ($f->reason === Finding::REASON_DELETED_JOURNAL) {
-                    echo '      ' . $c('Field', 'cyan') . '   : ' . $f->settingName .
-                         $c('  (journal_id = ' . $entity . ')', 'dim') . "\n";
-                } elseif ($f->reason === Finding::REASON_REVIEW_REVISION) {
-                    echo '      ' . $c('Field', 'cyan') . '   : ' . $f->settingName .
-                         $c('  (submission_id = ' . $entity . ')', 'dim') . "\n";
-                } elseif ($f->settingName !== '') {
-                    $localeLabel = ($f->locale === null || $f->locale === '')
-                        ? $c('no locale tag', 'red')
-                        : 'locale "' . $f->locale . '"';
-                    echo '      ' . $c('Field', 'cyan') . '   : ' . $f->settingName . '  (' . $localeLabel . ')' . "\n";
-                }
-
-                if ($f->valuePreview !== '') {
-                    $valueLabel = $f->reason === Finding::REASON_DELETED_JOURNAL ? 'Via' : 'Value';
-                    echo '      ' . $c($valueLabel, 'dim') . str_repeat(' ', 7 - mb_strlen($valueLabel)) . ': ' . $this->truncate($f->valuePreview, 100) . "\n";
-                }
-
-                if ($f->suggestedLocale !== '') {
-                    echo '      ' . $c('Suggest', 'green') . ' : tag this row with locale "' . $f->suggestedLocale . '"' . "\n";
-                }
-                echo "\n";
             }
         }
     }
 
-    // ── File export ──────────────────────────────────────────────────────
-
-    /**
-     * Writes the scenario detail to a plain-text file (no ANSI codes).
-     * Returns the absolute path to the saved file.
-     *
-     * @param int $scenario Scenario number (1-7)
-     * @param Finding[] $findings All findings for this scenario
-     * @param array<string, array{orphanFk?:?string}> $tableResults
-     * @param array<string, array{pk?:?string}> $entityResults
-     * @return string|null Absolute path of the saved file, null on failure
-     */
-    private function saveScenarioToFile(int $scenario, array $findings, array $tableResults, array $entityResults): string
+    private function saveScenarioToFile(int $scenario, array $findings, array $tableResults, array $entityResults): ?string
     {
         $lines = [];
-
         $label = self::SCENARIOS[$scenario]['label'];
         $total = $this->sumRowCounts($findings);
-
-        $byTable = [];
-        foreach ($findings as $f) {
-            $byTable[$f->table][] = $f;
-        }
-        ksort($byTable);
-
-        $nTables = count($byTable);
-
+        $byTable = $this->groupFindingsByTable($findings);
         $sep = str_repeat('─', 66);
 
         $lines[] = $sep;
         $lines[] = "Scenario {$scenario}: {$label}";
-        $lines[] = "{$total} record" . ($total === 1 ? '' : 's') . " across {$nTables} table" . ($nTables === 1 ? '' : 's');
+        $lines[] = "{$total} record" . ($total === 1 ? '' : 's') . ' across ' . count($byTable) . ' table' . (count($byTable) === 1 ? '' : 's');
         $lines[] = $sep;
         $lines[] = '';
 
         foreach ($byTable as $table => $rows) {
             $rowCount = $this->sumRowCounts($rows);
             $fkInfo = $this->parseFk($tableResults[$table]['orphanFk'] ?? null);
-            $entityLabel = $fkInfo['column'] ?? 'entity_id';
-            $parentTable = $fkInfo['parentTable'] ?? null;
-
-            $lines[] = "▸ {$table}  ({$rowCount} record" . ($rowCount === 1 ? ')' : 's)');
+            $lines[] = '▸ ' . $table . '  (' . $rowCount . ' record' . ($rowCount === 1 ? ')' : 's') . ')';
             $lines[] = '';
 
             foreach ($rows as $f) {
-                $entity = $f->entityId === null ? '(unknown)' : (string)$f->entityId;
-                $label = $entityLabel;
-                if ($f->reason === Finding::REASON_DELETED_JOURNAL) {
-                    // entityId carries the dead journal id, not this table's FK value
-                    $label = 'journal_id';
-                } elseif ($f->reason === Finding::REASON_REVIEW_REVISION) {
-                    // entityId carries the submission id, not a settings FK
-                    $label = 'submission_id';
-                } elseif ($f->reason === Finding::REASON_REQUIRED_NULL) {
-                    // entityId is the row's own pk — name it after the table's pk column
-                    $label = $entityResults[$f->table]['pk'] ?? 'entity_id';
-                }
-                $rowLabel = $f->rowCount > 1
-                    ? 'Journal #' . $f->pk . ' (' . number_format($f->rowCount) . ' rows)'
-                    : 'Row #' . $f->pk;
-                $lines[] = sprintf('    %s  (%s = %s)', $rowLabel, $label, $entity);
-                $lines[] = '      Problem : ' . $this->describeReason($f, $parentTable);
-
-                if ($f->reason === Finding::REASON_REQUIRED_NULL) {
-                    $lines[] = '      Column  : ' . $f->settingName . '  (declared required, currently NULL)';
-                } elseif ($f->reason === Finding::REASON_DELETED_JOURNAL) {
-                    $lines[] = '      Field   : ' . $f->settingName . '  (journal_id = ' . $entity . ')';
-                } elseif ($f->reason === Finding::REASON_REVIEW_REVISION) {
-                    $lines[] = '      Field   : ' . $f->settingName . '  (submission_id = ' . $entity . ')';
-                } elseif ($f->settingName !== '') {
-                    $localeLabel = ($f->locale === null || $f->locale === '')
-                        ? 'no locale tag'
-                        : 'locale "' . $f->locale . '"';
-                    $lines[] = '      Field   : ' . $f->settingName . '  (' . $localeLabel . ')';
-                }
-
-                if ($f->valuePreview !== '') {
-                    $valueLabel = $f->reason === Finding::REASON_DELETED_JOURNAL ? 'Via' : 'Value';
-                    $lines[] = '      ' . str_pad($valueLabel, 7) . ' : ' . $this->truncate($f->valuePreview, 100);
-                }
-
-                if ($f->suggestedLocale !== '') {
-                    $lines[] = '      Suggest : tag this row with locale "' . $f->suggestedLocale . '"';
-                }
-                $lines[] = '';
+                $lines = array_merge($lines, $this->findingDetailLines(
+                    $f,
+                    $fkInfo['column'] ?? 'entity_id',
+                    $fkInfo['parentTable'] ?? null,
+                    $entityResults
+                ));
             }
         }
 
-        $slug = $this->scenarioSlug($scenario);
-        $timestamp = date('Ymd_His');
-        $filename = "settingsHealthCheck_{$slug}_{$timestamp}.txt";
+        $filename = 'settingsHealthCheck_' . $this->scenarioSlug($scenario) . '_' . date('Ymd_His') . '.txt';
         $path = getcwd() . '/' . $filename;
-
-        $bytes = file_put_contents($path, implode("\n", $lines));
-        if ($bytes === false) {
-            return null;
-        }
-
-        return $path;
+        return file_put_contents($path, implode("\n", $lines)) === false ? null : $path;
     }
 
     /**
@@ -559,18 +473,15 @@ final class ReportWriter
     private function scenarioSlug(int $scenario): string
     {
         $slugs = [
-            1 => 'locale_schema',
-            2 => 'locale_heuristic',
-            3 => 'orphaned',
-            4 => 'required_null',
-            5 => 'setting_null',
-            6 => 'review_revision',
-            7 => 'deleted_journal',
+            1 => 'locale',
+            2 => 'orphaned',
+            3 => 'required_null',
+            4 => 'setting_null',
+            5 => 'review_revision',
+            6 => 'deleted_journal',
         ];
         return $slugs[$scenario] ?? 'unknown';
     }
-
-    // ── Shared utilities ──────────────────────────────────────────────────
 
     /**
      * Parses a foreign-key descriptor string (format: "user_id -> users(user_id)").
@@ -596,6 +507,22 @@ final class ReportWriter
     {
         switch ($f->reason) {
             case Finding::REASON_ORPHAN_ENTITY:
+                if ($f->table === 'files') {
+                    return 'This blob row in the central files table is not referenced by'
+                        . ' submission_files or submission_file_revisions. The database row'
+                        . ' and the file on disk should be removed.';
+                }
+                if (Finding::isEntityOrphan($f)) {
+                    $action = $f->suggestedLocale === EntityReferenceRule::ACTION_NULLIFY
+                        ? 'The invalid value should be set to NULL.'
+                        : 'The row(s) should be deleted.';
+                    return 'Column "' . $f->settingName . '" references missing row(s) in '
+                        . $f->valuePreview . '. ' . $action;
+                }
+                if ($f->table === 'publication_settings' && $f->settingName === 'issueId') {
+                    return 'The issueId setting stores "' . $f->valuePreview
+                        . '", but that issue no longer exists. The setting row should be removed.';
+                }
                 $where = $parentTable !== null ? ('"' . $parentTable . '"') : 'its parent table';
                 return 'This row references a record in ' . $where . ' that no longer exists. The setting is dangling and should be removed.';
             case Finding::REASON_SCHEMA_MISSING_LOCALE:
@@ -619,6 +546,111 @@ final class ReportWriter
                 return $message;
             default:
                 return 'Unrecognized issue (' . $f->reason . ').';
+        }
+    }
+
+    /**
+     * Formats the per-finding row label shown in scenario drill-down.
+     */
+    private function formatRowLabel(Finding $f): string
+    {
+        if ($f->table === 'files' && $f->reason === Finding::REASON_ORPHAN_ENTITY) {
+            return 'Unreferenced blobs (' . number_format($f->rowCount) . ' file'
+                . ($f->rowCount === 1 ? '' : 's') . ')';
+        }
+        if (Finding::isEntityOrphan($f)) {
+            return $f->pk . ' (' . number_format($f->rowCount) . ' row'
+                . ($f->rowCount === 1 ? '' : 's') . ')';
+        }
+        if ($f->reason === Finding::REASON_DELETED_JOURNAL && $f->rowCount > 1) {
+            return 'Journal #' . $f->pk . ' (' . number_format($f->rowCount) . ' rows)';
+        }
+        if ($f->rowCount > 1) {
+            return 'Aggregate (' . number_format($f->rowCount) . ' rows)';
+        }
+        if (Finding::isBulk($f)) {
+            return 'Bulk fix (' . number_format($f->rowCount) . ' row'
+                . ($f->rowCount === 1 ? '' : 's') . ')';
+        }
+        return 'Row #' . $f->pk;
+    }
+
+    /** @param Finding[] $findings @return array<string, Finding[]> */
+    private function groupFindingsByTable(array $findings): array
+    {
+        $byTable = [];
+        foreach ($findings as $f) {
+            $byTable[$f->table][] = $f;
+        }
+        ksort($byTable);
+        return $byTable;
+    }
+
+    private function resolveEntityLabel(Finding $f, string $defaultLabel, array $entityResults): string
+    {
+        if ($f->reason === Finding::REASON_DELETED_JOURNAL) {
+            return 'journal_id';
+        }
+        if ($f->reason === Finding::REASON_REVIEW_REVISION) {
+            return 'submission_id';
+        }
+        if ($f->reason === Finding::REASON_REQUIRED_NULL) {
+            return $entityResults[$f->table]['pk'] ?? 'entity_id';
+        }
+        return $defaultLabel;
+    }
+
+    /** @return string[] */
+    private function findingDetailLines(Finding $f, string $entityLabel, ?string $parentTable, array $entityResults): array
+    {
+        $entity = $f->entityId === null ? '(unknown)' : (string) $f->entityId;
+        $label = $this->resolveEntityLabel($f, $entityLabel, $entityResults);
+        $lines = [];
+
+        if ($f->table === 'files' || Finding::isEntityOrphan($f)) {
+            $lines[] = '    ' . $this->formatRowLabel($f);
+            if (Finding::isEntityOrphan($f)) {
+                $lines[] = '      Fix     : ' . $this->entityOrphanFixLabel($f);
+            }
+        } else {
+            $lines[] = sprintf('    %s  (%s = %s)', $this->formatRowLabel($f), $label, $entity);
+        }
+        $lines[] = '      Problem : ' . $this->describeReason($f, $parentTable);
+
+        if ($f->reason === Finding::REASON_REQUIRED_NULL) {
+            $lines[] = '      Column  : ' . $f->settingName . '  (declared required, currently NULL)';
+        } elseif ($f->reason === Finding::REASON_DELETED_JOURNAL) {
+            $lines[] = '      Field   : ' . $f->settingName . '  (journal_id = ' . $entity . ')';
+        } elseif ($f->reason === Finding::REASON_REVIEW_REVISION) {
+            $lines[] = '      Field   : ' . $f->settingName . '  (submission_id = ' . $entity . ')';
+        } elseif ($f->settingName !== '') {
+            $localeLabel = ($f->locale === null || $f->locale === '')
+                ? 'no locale tag'
+                : 'locale "' . $f->locale . '"';
+            $lines[] = '      Field   : ' . $f->settingName . '  (' . $localeLabel . ')';
+        }
+
+        if ($f->valuePreview !== '') {
+            $valueLabel = $f->reason === Finding::REASON_DELETED_JOURNAL ? 'Via' : 'Value';
+            $lines[] = '      ' . str_pad($valueLabel, 7) . ' : ' . $this->truncate($f->valuePreview, 100);
+        }
+
+        if ($f->suggestedLocale !== '' && !Finding::isEntityOrphan($f)) {
+            $lines[] = '      Suggest : tag this row with locale "' . $f->suggestedLocale . '"';
+        }
+        $lines[] = '';
+        return $lines;
+    }
+
+    private function entityOrphanFixLabel(Finding $f): string
+    {
+        switch ($f->suggestedLocale) {
+            case EntityReferenceRule::ACTION_NULLIFY:
+                return 'set invalid FK to NULL';
+            case EntityReferenceRule::ACTION_DELETE_OPTIONAL:
+                return 'delete rows with invalid optional FK';
+            default:
+                return 'delete rows with invalid required FK';
         }
     }
 

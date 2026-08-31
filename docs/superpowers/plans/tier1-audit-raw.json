@@ -1,0 +1,380 @@
+{
+    "database": "ojs_3_3_0",
+    "auditedAt": "2026-08-26T16:12:36+02:00",
+    "liveJournalIds": [
+        22
+    ],
+    "registryTablesAllPresent": true,
+    "candidates": [
+        {
+            "tier": 1,
+            "action": "add_root",
+            "table": "subeditor_submission_group",
+            "exists": true,
+            "columns": [
+                "context_id",
+                "assoc_id",
+                "user_id",
+                "assoc_type"
+            ],
+            "primaryKey": [],
+            "resolvedIdentity": "user_id",
+            "journalCol": "context_id",
+            "journalColExists": true,
+            "parent": null,
+            "fk": null,
+            "fkExists": null,
+            "note": ""
+        },
+        {
+            "tier": 1,
+            "action": "consider_root",
+            "table": "static_pages",
+            "exists": true,
+            "columns": [
+                "static_page_id",
+                "path",
+                "context_id"
+            ],
+            "primaryKey": [
+                "static_page_id"
+            ],
+            "resolvedIdentity": "static_page_id",
+            "journalCol": "context_id",
+            "journalColExists": true,
+            "parent": null,
+            "fk": null,
+            "fkExists": null,
+            "note": ""
+        },
+        {
+            "tier": 0,
+            "action": "exclude",
+            "table": "notification_subscription_settings",
+            "exists": true,
+            "columns": [
+                "setting_id",
+                "setting_name",
+                "setting_value",
+                "user_id",
+                "context",
+                "setting_type"
+            ],
+            "primaryKey": [
+                "setting_id"
+            ],
+            "resolvedIdentity": "setting_id",
+            "journalCol": "context",
+            "journalColExists": true,
+            "parent": null,
+            "fk": null,
+            "fkExists": null,
+            "note": "string context \u2014 deliberate exclusion"
+        },
+        {
+            "tier": 1,
+            "action": "add_child",
+            "table": "submission_file_revisions",
+            "exists": true,
+            "columns": [
+                "revision_id",
+                "submission_file_id",
+                "file_id"
+            ],
+            "primaryKey": [
+                "revision_id"
+            ],
+            "resolvedIdentity": "revision_id",
+            "journalCol": null,
+            "journalColExists": null,
+            "parent": "submission_files",
+            "fk": "submission_file_id",
+            "fkExists": true,
+            "note": ""
+        },
+        {
+            "tier": 1,
+            "action": "add_child",
+            "table": "submission_search_object_keywords",
+            "exists": true,
+            "columns": [
+                "object_id",
+                "keyword_id",
+                "pos"
+            ],
+            "primaryKey": [],
+            "resolvedIdentity": "object_id",
+            "journalCol": null,
+            "journalColExists": null,
+            "parent": "submission_search_objects",
+            "fk": "object_id",
+            "fkExists": true,
+            "note": ""
+        },
+        {
+            "tier": 1,
+            "action": "add_child",
+            "table": "filter_settings",
+            "exists": true,
+            "columns": [
+                "filter_id",
+                "locale",
+                "setting_name",
+                "setting_value",
+                "setting_type"
+            ],
+            "primaryKey": [],
+            "resolvedIdentity": "filter_id",
+            "journalCol": null,
+            "journalColExists": null,
+            "parent": "filters",
+            "fk": "filter_id",
+            "fkExists": true,
+            "note": ""
+        },
+        {
+            "tier": 1,
+            "action": "add_child",
+            "table": "library_file_settings",
+            "exists": true,
+            "columns": [
+                "file_id",
+                "locale",
+                "setting_name",
+                "setting_value",
+                "setting_type"
+            ],
+            "primaryKey": [],
+            "resolvedIdentity": "file_id",
+            "journalCol": null,
+            "journalColExists": null,
+            "parent": "library_files",
+            "fk": "file_id",
+            "fkExists": true,
+            "note": ""
+        },
+        {
+            "tier": 1,
+            "action": "add_child_alt_path",
+            "table": "navigation_menu_item_assignments",
+            "exists": true,
+            "columns": [
+                "navigation_menu_item_assignment_id",
+                "navigation_menu_id",
+                "navigation_menu_item_id",
+                "parent_id",
+                "seq"
+            ],
+            "primaryKey": [
+                "navigation_menu_item_assignment_id"
+            ],
+            "resolvedIdentity": "navigation_menu_item_assignment_id",
+            "journalCol": null,
+            "journalColExists": null,
+            "parent": "navigation_menus",
+            "fk": "navigation_menu_id",
+            "fkExists": true,
+            "note": "already reachable via navigation_menu_items"
+        },
+        {
+            "tier": 1,
+            "action": "add_child",
+            "table": "review_form_responses",
+            "exists": true,
+            "columns": [
+                "review_form_element_id",
+                "review_id",
+                "response_type",
+                "response_value"
+            ],
+            "primaryKey": [],
+            "resolvedIdentity": "review_id",
+            "journalCol": null,
+            "journalColExists": null,
+            "parent": "review_assignments",
+            "fk": "review_id",
+            "fkExists": true,
+            "note": "also reachable via review_form_elements"
+        },
+        {
+            "tier": 1,
+            "action": "add_child",
+            "table": "queries",
+            "exists": true,
+            "columns": [
+                "query_id",
+                "assoc_type",
+                "assoc_id",
+                "stage_id",
+                "seq",
+                "date_posted",
+                "date_modified",
+                "closed"
+            ],
+            "primaryKey": [
+                "query_id"
+            ],
+            "resolvedIdentity": "query_id",
+            "journalCol": null,
+            "journalColExists": null,
+            "parent": "submissions",
+            "fk": "assoc_id",
+            "fkExists": true,
+            "note": "requires assoc_type = ASSOC_TYPE_SUBMISSION"
+        },
+        {
+            "tier": 1,
+            "action": "add_child",
+            "table": "query_participants",
+            "exists": true,
+            "columns": [
+                "query_id",
+                "user_id"
+            ],
+            "primaryKey": [],
+            "resolvedIdentity": "query_id",
+            "journalCol": null,
+            "journalColExists": null,
+            "parent": "queries",
+            "fk": "query_id",
+            "fkExists": true,
+            "note": ""
+        },
+        {
+            "tier": 1,
+            "action": "add_tombstone_chain",
+            "table": "data_object_tombstones",
+            "exists": true,
+            "columns": [
+                "tombstone_id",
+                "data_object_id",
+                "date_deleted",
+                "set_spec",
+                "set_name",
+                "oai_identifier"
+            ],
+            "primaryKey": [
+                "tombstone_id"
+            ],
+            "resolvedIdentity": "tombstone_id",
+            "journalCol": null,
+            "journalColExists": null,
+            "parent": null,
+            "fk": null,
+            "fkExists": null,
+            "note": "no journal col; link via data_object_id \u2192 submission"
+        },
+        {
+            "tier": 1,
+            "action": "add_child",
+            "table": "data_object_tombstone_settings",
+            "exists": true,
+            "columns": [
+                "tombstone_id",
+                "locale",
+                "setting_name",
+                "setting_value",
+                "setting_type"
+            ],
+            "primaryKey": [],
+            "resolvedIdentity": "tombstone_id",
+            "journalCol": null,
+            "journalColExists": null,
+            "parent": "data_object_tombstones",
+            "fk": "tombstone_id",
+            "fkExists": true,
+            "note": ""
+        },
+        {
+            "tier": 1,
+            "action": "defer",
+            "table": "files",
+            "exists": true,
+            "columns": [
+                "file_id",
+                "path",
+                "mimetype"
+            ],
+            "primaryKey": [
+                "file_id"
+            ],
+            "resolvedIdentity": "file_id",
+            "journalCol": null,
+            "journalColExists": null,
+            "parent": "submission_files",
+            "fk": "file_id",
+            "fkExists": true,
+            "note": "shared blob table \u2014 delete only when unreferenced"
+        },
+        {
+            "tier": 1,
+            "action": "already_in_registry",
+            "table": "publication_categories",
+            "exists": true,
+            "columns": [
+                "publication_id",
+                "category_id"
+            ],
+            "primaryKey": [],
+            "resolvedIdentity": "publication_id",
+            "journalCol": null,
+            "journalColExists": null,
+            "parent": "publications",
+            "fk": "publication_id",
+            "fkExists": true,
+            "note": ""
+        },
+        {
+            "tier": 2,
+            "action": "pass_g",
+            "table": "publication_settings",
+            "exists": true,
+            "columns": [
+                "publication_id",
+                "locale",
+                "setting_name",
+                "setting_value"
+            ],
+            "primaryKey": [],
+            "resolvedIdentity": null,
+            "journalCol": null,
+            "journalColExists": null,
+            "parent": null,
+            "fk": null,
+            "fkExists": null,
+            "note": "issueId setting-value orphan"
+        }
+    ],
+    "deadJournalLeftoverCounts": {
+        "subeditor_submission_group": 0,
+        "static_pages": 5,
+        "submission_file_revisions": 28957,
+        "submission_search_object_keywords": 0,
+        "filter_settings": 29,
+        "library_file_settings": 222,
+        "navigation_menu_item_assignments_via_menu": 7,
+        "review_form_responses_via_assignment": 0,
+        "queries": 11453,
+        "query_participants": 18823,
+        "data_object_tombstones": 13,
+        "data_object_tombstone_settings": 3,
+        "files_via_dead_submission_files": 26879
+    },
+    "tier2": {
+        "issueId_setting_orphans": 4155
+    },
+    "missingRegistryTables": [],
+    "submission_file_settings_columns": [
+        "submission_file_id",
+        "locale",
+        "setting_name",
+        "setting_value",
+        "setting_type"
+    ],
+    "subeditor_submission_group_columns": [
+        "context_id",
+        "assoc_id",
+        "user_id",
+        "assoc_type"
+    ]
+}

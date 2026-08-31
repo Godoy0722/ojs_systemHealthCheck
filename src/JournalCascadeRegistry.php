@@ -29,6 +29,9 @@ final class JournalCascadeRegistry
     /** ASSOC_TYPE_JOURNAL — 0x0000100, see classes/core/Application.inc.php. */
     public const ASSOC_TYPE_JOURNAL = 256;
 
+    /** ASSOC_TYPE_SUBMISSION — 0x0100009, see lib/pkp/classes/core/PKPApplication.inc.php. */
+    public const ASSOC_TYPE_SUBMISSION = 0x0100009;
+
     /**
      * Tables carrying a direct journal reference.
      * table => [journal column, row-identity column]
@@ -65,6 +68,8 @@ final class JournalCascadeRegistry
         'notifications'         => ['context_id', 'notification_id'],
         'email_templates'       => ['context_id', 'email_id'],
         'completed_payments'    => ['context_id', 'completed_payment_id'],
+        'subeditor_submission_group' => ['context_id', 'context_id'],
+        'static_pages'          => ['context_id', 'static_page_id'],
     ];
 
     /**
@@ -80,7 +85,7 @@ final class JournalCascadeRegistry
 
     /**
      * Descendant chains, keyed by parent table.
-     * parent => [parent identity column, [[child table, child FK column], ...]]
+     * parent => [parent identity column, [[child table, child FK column, optional assoc_type], ...]]
      *
      * A table appears exactly once across DIRECT_ROOTS, ASSOC_ROOTS and the
      * child lists here. Tables that carry their own journal column
@@ -101,15 +106,19 @@ final class JournalCascadeRegistry
             ['issue_galley_settings', 'galley_id'],
         ]],
         'submissions' => ['submission_id', [
+            // Must precede publications / review_* siblings: those tables FK to
+            // submission_files.submission_file_id, so submission_files is deleted last.
+            ['submission_files', 'submission_id'],
             ['submission_settings', 'submission_id'],
             ['publications', 'submission_id'],
             ['edit_decisions', 'submission_id'],
             ['review_rounds', 'submission_id'],
             ['review_assignments', 'submission_id'],
             ['stage_assignments', 'submission_id'],
-            ['submission_files', 'submission_id'],
             ['submission_comments', 'submission_id'],
             ['submission_search_objects', 'submission_id'],
+            ['data_object_tombstones', 'data_object_id'],
+            ['queries', 'assoc_id', self::ASSOC_TYPE_SUBMISSION],
         ]],
         'publications' => ['publication_id', [
             ['publication_settings', 'publication_id'],
@@ -135,6 +144,7 @@ final class JournalCascadeRegistry
         ]],
         'submission_files' => ['submission_file_id', [
             ['submission_file_settings', 'submission_file_id'],
+            ['submission_file_revisions', 'submission_file_id'],
         ]],
         'user_groups' => ['user_group_id', [
             ['user_group_settings', 'user_group_id'],
@@ -145,6 +155,21 @@ final class JournalCascadeRegistry
         ]],
         'genres' => ['genre_id', [
             ['genre_settings', 'genre_id'],
+        ]],
+        'filters' => ['filter_id', [
+            ['filter_settings', 'filter_id'],
+        ]],
+        'library_files' => ['file_id', [
+            ['library_file_settings', 'file_id'],
+        ]],
+        'submission_search_objects' => ['object_id', [
+            ['submission_search_object_keywords', 'object_id'],
+        ]],
+        'data_object_tombstones' => ['tombstone_id', [
+            ['data_object_tombstone_settings', 'tombstone_id'],
+        ]],
+        'queries' => ['query_id', [
+            ['query_participants', 'query_id'],
         ]],
         'navigation_menu_items' => ['navigation_menu_item_id', [
             ['navigation_menu_item_settings', 'navigation_menu_item_id'],
@@ -318,6 +343,7 @@ final class JournalCascadeRegistry
         }
         foreach ($children as $child) {
             [$childTable, $childFk] = $child;
+            $stepAssocType = isset($child[2]) ? (int) $child[2] : null;
             if (isset($seen[$childTable])) {
                 $this->warnings[] = sprintf('cascade: %s reached twice, keeping the first path', $childTable);
                 continue;
@@ -325,7 +351,11 @@ final class JournalCascadeRegistry
             $childIdentity = isset($this->descendants[$childTable])
                 ? $this->descendants[$childTable][0]
                 : $childFk;
-            if (!$this->verify($childTable, [$childFk])) {
+            $requiredColumns = [$childFk];
+            if ($stepAssocType !== null) {
+                $requiredColumns[] = 'assoc_type';
+            }
+            if (!$this->verify($childTable, $requiredColumns)) {
                 continue;
             }
             $this->plan[] = [
@@ -334,7 +364,7 @@ final class JournalCascadeRegistry
                 'source' => 'parent',
                 'column' => $childFk,
                 'parent' => $parent,
-                'assocType' => null,
+                'assocType' => $stepAssocType,
                 'depth' => $depth,
                 'via' => $via . ' > ' . $childTable,
                 'aggregate' => false,

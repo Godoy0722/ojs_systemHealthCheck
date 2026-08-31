@@ -9,22 +9,7 @@
  *
  * @class Fixer
  *
- * @brief Applies the basic remediations for the findings the Scanner produced.
- *        WRITES to the database — only invoked when --fix is passed.
- *
- *        - Deleted-journal rows    -> the whole cascade is deleted, deepest
- *                                     table first, one transaction per journal.
- *        - Orphaned settings       -> the dangling row is deleted.
- *        - Missing-locale settings -> the row is stamped with the default locale.
- *        - Review-revision files   -> file and database rows are cascade-deleted.
- *        - Empty-field findings    -> left untouched (no safe automatic fix yet).
- *
- *        Deleted-journal findings are processed first, so an orphaned settings
- *        row that the cascade already removed is counted as alreadyRemoved
- *        rather than as a failure.
- *
- *        Each unit is fixed independently; a failure on one is recorded as a
- *        warning and does not abort the rest of the run.
+ * @brief Applies remediations for Scanner findings. Only invoked with --fix.
  */
 
 namespace APP\tools\settingsHealthCheck\src;
@@ -37,17 +22,11 @@ final class Fixer
     /** @var JournalCascadeRegistry|null */
     private $cascadeRegistry;
 
-    /** @var string Locale stamped onto missing-locale rows that carry no suggestion. */
     private string $defaultLocale;
 
     /** @var string[] */
     private array $warnings = [];
 
-    /**
-     * @brief Resolves the site primary locale once so every fix uses the same
-     *        fallback. The cascade registry is required only for
-     *        deleted-journal findings.
-     */
     public function __construct(IlluminateDatabaseGateway $gateway, ?JournalCascadeRegistry $cascadeRegistry = null)
     {
         $this->gateway = $gateway;
@@ -57,21 +36,16 @@ final class Fixer
     }
 
     /**
-     * Applies remediations to every finding. Deleted-journal findings run
-     * first, as a cascade per journal inside one transaction each. The
-     * remaining findings are then fixed row by row: orphaned rows deleted,
-     * missing-locale rows stamped with the default locale, review-revision
-     * files cascade-deleted. Empty-field findings are skipped (no safe
-     * automatic fix). Each unit is independent — a failure on one does not
-     * abort the rest.
-     *
      * @param Finding[] $findings
-     * @return array{orphansDeleted:int, localesFixed:int, reviewFilesDeleted:int, journalRecordsDeleted:int, alreadyRemoved:int, skipped:int, failed:int}
+     * @return array{orphansDeleted:int, orphanFilesDeleted:int, entityReferencesRecovered:int, entityOrphansFixed:int, localesFixed:int, reviewFilesDeleted:int, journalRecordsDeleted:int, alreadyRemoved:int, skipped:int, failed:int}
      */
     public function fix(array $findings): array
     {
         $result = [
             'orphansDeleted' => 0,
+            'orphanFilesDeleted' => 0,
+            'entityReferencesRecovered' => 0,
+            'entityOrphansFixed' => 0,
             'localesFixed' => 0,
             'reviewFilesDeleted' => 0,
             'journalRecordsDeleted' => 0,
@@ -79,6 +53,9 @@ final class Fixer
             'skipped' => 0,
             'failed' => 0,
         ];
+
+        $entityCleaner = new OrphanReferenceCleaner($this->gateway);
+        $result['entityReferencesRecovered'] = $entityCleaner->recoverReferences();
 
         $journalFindings = [];
         $rest = [];
@@ -94,10 +71,49 @@ final class Fixer
             $result['journalRecordsDeleted'] = $this->deleteDeadJournals($journalFindings, $result);
         }
 
+        $fixedEntityRules = [];
+        $fixedBulk = [];
         foreach ($rest as $finding) {
             try {
+                if (Finding::isBulk($finding)) {
+                    $bulkKey = $finding->table . ':' . $finding->pk;
+                    if (isset($fixedBulk[$bulkKey])) {
+                        continue;
+                    }
+                    $fixedBulk[$bulkKey] = true;
+                    if ($this->fixBulkFinding($finding, $entityCleaner, $result)) {
+                        continue;
+                    }
+                }
+
                 switch ($finding->reason) {
                     case Finding::REASON_ORPHAN_ENTITY:
+                        if ($finding->table === 'files') {
+                            if ($finding->pk !== 'unreferenced') {
+                                break;
+                            }
+                            $deleted = $this->gateway->deleteUnreferencedFiles();
+                            if ($deleted > 0) {
+                                $result['orphanFilesDeleted'] += $deleted;
+                            } elseif ($finding->rowCount > 0) {
+                                $result['failed']++;
+                            }
+                            break;
+                        }
+                        if (Finding::isEntityOrphan($finding)) {
+                            $ruleKey = (string) $finding->pk;
+                            if (isset($fixedEntityRules[$ruleKey])) {
+                                break;
+                            }
+                            $fixedEntityRules[$ruleKey] = true;
+                            $fixed = $entityCleaner->fixFinding($finding);
+                            if ($fixed > 0) {
+                                $result['entityOrphansFixed'] += $fixed;
+                            } elseif ($finding->rowCount > 0) {
+                                $result['failed']++;
+                            }
+                            break;
+                        }
                         $deleted = $this->gateway->deleteSettingRow(
                             $finding->table,
                             $finding->pk,
@@ -106,7 +122,7 @@ final class Fixer
                         );
                         if ($deleted > 0) {
                             $result['orphansDeleted'] += $deleted;
-                        } elseif ($this->wasRemovedByCascade($finding)) {
+                        } elseif ($this->settingRowAlreadyGone($finding)) {
                             $result['alreadyRemoved']++;
                         } else {
                             $result['failed']++;
@@ -132,8 +148,6 @@ final class Fixer
                         break;
 
                     default:
-                        // Empty-field findings (required NULL / NULL setting_value)
-                        // have no safe automatic fix yet.
                         $result['skipped']++;
                 }
             } catch (\Throwable $e) {
@@ -148,17 +162,76 @@ final class Fixer
             }
         }
 
+        foreach ($entityCleaner->getWarnings() as $w) {
+            $this->warnings[] = $w;
+        }
+
         return $result;
     }
 
     /**
-     * Deletes every leftover row for each dead journal, deepest table first,
-     * one transaction per journal. A failure rolls that journal back, is
-     * recorded as a warning, and the remaining journals still proceed.
-     *
-     * @param Finding[] $journalFindings Findings with REASON_DELETED_JOURNAL
-     * @param array{failed:int} $result Mutated in place to count failures
-     * @return int Total rows deleted across all journals
+     * @param array{orphansDeleted:int, orphanFilesDeleted:int, entityReferencesRecovered:int, entityOrphansFixed:int, localesFixed:int, reviewFilesDeleted:int, journalRecordsDeleted:int, alreadyRemoved:int, skipped:int, failed:int} $result
+     */
+    private function fixBulkFinding(Finding $finding, OrphanReferenceCleaner $entityCleaner, array &$result): bool
+    {
+        $pk = (string) $finding->pk;
+        if (strpos($pk, Finding::BULK_PREFIX . 'orphan:') === 0) {
+            $parts = explode(':', substr($pk, strlen(Finding::BULK_PREFIX . 'orphan:')));
+            if (count($parts) !== 4) {
+                return false;
+            }
+            [$fkCol, $parentTable, $parentCol, $ignoreZeroFlag] = $parts;
+            $deleted = $this->gateway->deleteOrphanSettings(
+                $finding->table,
+                $fkCol,
+                $parentTable,
+                $parentCol,
+                $ignoreZeroFlag === '1'
+            );
+            if ($deleted > 0) {
+                $result['orphansDeleted'] += $deleted;
+            } elseif ($finding->rowCount > 0) {
+                $result['failed']++;
+            }
+            return true;
+        }
+        if ($pk === Finding::bulkPk('issueId')) {
+            $deleted = $this->gateway->deleteInvalidPublicationIssueIdSettings();
+            if ($deleted > 0) {
+                $result['orphansDeleted'] += $deleted;
+            } elseif ($finding->rowCount > 0) {
+                $result['failed']++;
+            }
+            return true;
+        }
+        if ($pk === Finding::bulkPk('locale-schema') || $pk === Finding::bulkPk('locale-heuristic')) {
+            $names = $finding->entityId !== null && $finding->entityId !== ''
+                ? explode('|', (string) $finding->entityId)
+                : [];
+            $locale = $finding->suggestedLocale !== '' ? $finding->suggestedLocale : $this->defaultLocale;
+            $updated = $this->gateway->fixEmptyLocales($finding->table, $names, $locale);
+            if ($updated > 0) {
+                $result['localesFixed'] += $updated;
+            } elseif ($finding->rowCount > 0) {
+                $result['failed']++;
+            }
+            return true;
+        }
+        if ($pk === Finding::bulkPk('review')) {
+            $deleted = $this->gateway->deleteAllReviewRevisionFiles();
+            if ($deleted > 0) {
+                $result['reviewFilesDeleted'] += $deleted;
+            } elseif ($finding->rowCount > 0) {
+                $result['failed']++;
+            }
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * @param Finding[] $journalFindings
+     * @param array{failed:int} $result
      */
     private function deleteDeadJournals(array $journalFindings, array &$result): int
     {
@@ -168,84 +241,105 @@ final class Fixer
             return 0;
         }
 
-        // journalId => table => [identity values]
-        $byJournal = [];
-        foreach ($journalFindings as $f) {
-            $journalId = (int) $f->entityId;
-            $byJournal[$journalId][$f->table][] = $f->pk;
+        $journalIds = [];
+        if ($this->cascadeRegistry !== null) {
+            try {
+                foreach ($this->gateway->findDeadJournalIds(
+                    $this->cascadeRegistry->getDirectRootColumns()
+                ) as $journalId) {
+                    $journalIds[(int) $journalId] = true;
+                }
+            } catch (\Throwable $e) {
+                $this->warnings[] = 'Could not resolve dead journal ids: ' . $e->getMessage();
+            }
+        }
+        if (empty($journalIds)) {
+            foreach ($journalFindings as $f) {
+                if ($f->entityId !== null) {
+                    $journalIds[(int) $f->entityId] = true;
+                }
+            }
         }
 
-        // Deepest table first: the plan is ordered parents-before-children.
-        $plan = array_reverse($this->cascadeRegistry->build());
-
+        $forwardPlan = $this->cascadeRegistry->build();
+        $plan = array_reverse($forwardPlan);
+        $planByTable = [];
+        foreach ($forwardPlan as $planStep) {
+            $planByTable[$planStep['table']] = $planStep;
+        }
         $totalDeleted = 0;
-        foreach ($byJournal as $journalId => $tables) {
+
+        foreach (array_keys($journalIds) as $journalId) {
             try {
-                $totalDeleted += $this->gateway->runInTransaction(function () use ($plan, $tables, $journalId) {
+                $totalDeleted += $this->gateway->runInTransaction(function () use ($plan, $planByTable, $journalId) {
                     $deleted = 0;
                     foreach ($plan as $step) {
-                        $table = $step['table'];
-                        if (!isset($tables[$table])) {
-                            continue;
+                        if ($step['table'] === 'submission_files' && $step['column'] === 'submission_id') {
+                            $deleted += $this->gateway->deleteSubmissionFileDependentsForJournal($journalId);
                         }
-
-                        if ($step['source'] === 'journal') {
-                            // Match the journal column, never the identity
-                            // column: a root's identity is not always unique
-                            // per journal (plugin_settings is keyed by
-                            // plugin_name), so deleting by identity would
-                            // cross journal boundaries and destroy live data.
-                            $deleted += $this->gateway->deleteRowsByColumn(
-                                $table,
-                                $step['column'],
-                                [$journalId],
-                                $step['assocType']
-                            );
-                            continue;
-                        }
-
-                        // Descendants are matched by their FK against the
-                        // parent's identity values, which the scan already
-                        // resolved and reported.
-                        $parentIds = $tables[$step['parent']] ?? [];
-                        if (empty($parentIds)) {
-                            continue;
-                        }
-                        $deleted += $this->gateway->deleteRowsByColumn(
-                            $table,
-                            $step['column'],
-                            array_values(array_unique($parentIds)),
-                            null
-                        );
+                        $deleted += $this->gateway->deleteRowsByDeadJournalPath($step, $planByTable, $journalId);
                     }
                     return $deleted;
                 });
             } catch (\Throwable $e) {
                 $rows = 0;
-                foreach ($tables as $ids) {
-                    $rows += count($ids);
+                foreach ($forwardPlan as $step) {
+                    if ($step['source'] !== 'journal') {
+                        continue;
+                    }
+                    $rows += $this->gateway->countRowsByColumn(
+                        $step['table'],
+                        $step['column'],
+                        [$journalId],
+                        $step['assocType']
+                    );
                 }
-                $result['failed'] += $rows;
-                $this->warnings[] = sprintf(
-                    'Cascade rolled back for journal %d: %s',
-                    $journalId,
-                    $e->getMessage()
-                );
+                $result['failed'] += $rows > 0 ? $rows : 1;
+                $this->warnings[] = sprintf('Cascade rolled back for journal %d: %s', $journalId, $e->getMessage());
             }
         }
 
         return $totalDeleted;
     }
 
-    /**
-     * True when an orphaned settings row reported zero deletions because the
-     * deleted-journal cascade already removed it, rather than because the
-     * delete failed. Checked by confirming the row is genuinely gone.
-     *
-     * @param Finding $finding
-     * @return bool
-     */
-    private function wasRemovedByCascade(Finding $finding): bool
+    /** @return array<string, array<int|string>> */
+    private function resolveCascadeIds(array $forwardPlan, int $journalId): array
+    {
+        $idsByTable = [];
+        foreach ($forwardPlan as $step) {
+            if ($step['source'] === 'journal') {
+                if (!empty($step['aggregate'])) {
+                    $ids = [$journalId];
+                } else {
+                    $ids = $this->gateway->findRowIdsByColumn(
+                        $step['table'],
+                        $step['identity'],
+                        $step['column'],
+                        [$journalId],
+                        $step['assocType']
+                    );
+                }
+            } else {
+                $parentIds = $idsByTable[$step['parent']] ?? [];
+                if (empty($parentIds)) {
+                    continue;
+                }
+                $ids = $this->gateway->findRowIdsByColumn(
+                    $step['table'],
+                    $step['identity'],
+                    $step['column'],
+                    $parentIds,
+                    $step['assocType']
+                );
+            }
+            if (!empty($ids)) {
+                $idsByTable[$step['table']] = $ids;
+            }
+        }
+        return $idsByTable;
+    }
+
+    private function settingRowAlreadyGone(Finding $finding): bool
     {
         return $this->gateway->deleteSettingRow(
             $finding->table,
@@ -255,12 +349,7 @@ final class Fixer
         ) === 0;
     }
 
-    /**
-     * Non-fatal errors collected during the fix pass (e.g. one row that
-     * couldn't be updated).
-     *
-     * @return string[]
-     */
+    /** @return string[] */
     public function getWarnings(): array
     {
         return $this->warnings;
