@@ -48,13 +48,16 @@ final class OrphanReferenceCleaner
         $this->gateway = $gateway;
     }
 
-    /** @return Finding[] */
-    public function scan(): array
+    /** @param callable(string):void|null $onRule Called with source table name before each rule is scanned. */
+    public function scan(?callable $onRule = null): array
     {
         $findings = [];
         $live = $this->getLiveJournalIds();
 
         foreach (EntityReferenceRegistry::rules() as $rule) {
+            if ($onRule !== null) {
+                $onRule($rule->sourceTable);
+            }
             if (!$this->validateRule($rule)) {
                 continue;
             }
@@ -83,11 +86,21 @@ final class OrphanReferenceCleaner
         return $findings;
     }
 
-    /** Repoint current_publication_id and section_id before destructive fixes. */
-    public function recoverReferences(): int
+    /**
+     * Repoint current_publication_id and section_id before destructive fixes.
+     *
+     * @param callable(string):void|null $onStep Called with table name before each recovery pass.
+     */
+    public function recoverReferences(?callable $onStep = null): int
     {
-        $updated = $this->recoverCurrentPublicationIds() + $this->recoverSectionIds();
-        return $updated;
+        if ($onStep !== null) {
+            $onStep('submissions');
+        }
+        $updated = $this->recoverCurrentPublicationIds();
+        if ($onStep !== null) {
+            $onStep('publications');
+        }
+        return $updated + $this->recoverSectionIds();
     }
 
     public function fixFinding(Finding $finding): int
@@ -100,6 +113,57 @@ final class OrphanReferenceCleaner
             return 0;
         }
         return $this->fixInvalidReferences($rule, $this->getLiveJournalIds());
+    }
+
+    /**
+     * Expands an aggregate entity-reference finding into one Finding per offending row.
+     *
+     * @return Finding[]
+     */
+    public function expandEntityOrphanFinding(Finding $finding): array
+    {
+        if ($finding->reason !== Finding::REASON_ORPHAN_ENTITY || !Finding::isEntityOrphan($finding)) {
+            return [$finding];
+        }
+        $rule = EntityReferenceRegistry::findByKey((string) $finding->pk);
+        if ($rule === null || !$this->validateRule($rule)) {
+            return [$finding];
+        }
+
+        $meta = $this->gateway->getTableMetaPublic($rule->sourceTable);
+        $pkCol = $meta['pk'] ?? $rule->sourceColumn;
+        $select = ['s.' . $pkCol . ' as pk', 's.' . $rule->sourceColumn . ' as fk'];
+        if ($this->gateway->columnExists($rule->sourceTable, 'setting_name')) {
+            $select[] = 's.setting_name';
+        }
+        if ($this->gateway->columnExists($rule->sourceTable, 'locale')) {
+            $select[] = 's.locale';
+        }
+
+        $expanded = [];
+        try {
+            $cursor = $this->buildInvalidReferenceQuery($rule, $this->getLiveJournalIds())
+                ->select($select)
+                ->orderBy('s.' . $pkCol)
+                ->cursor();
+        } catch (\Throwable $e) {
+            return [$finding];
+        }
+
+        foreach ($cursor as $row) {
+            $expanded[] = new Finding(
+                $rule->sourceTable,
+                $row->pk,
+                $row->fk,
+                $rule->sourceColumn,
+                isset($row->locale) ? (string) $row->locale : null,
+                $rule->referenceTable . '.' . $rule->referenceColumn,
+                Finding::REASON_ORPHAN_ENTITY,
+                $rule->action
+            );
+        }
+
+        return $expanded !== [] ? $expanded : [$finding];
     }
 
     /** @return string[] */

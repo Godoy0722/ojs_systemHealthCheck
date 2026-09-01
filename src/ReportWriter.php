@@ -27,6 +27,14 @@ final class ReportWriter
     private const C_CYAN   = "\033[36m";
     private const C_MAGENTA = "\033[35m";
 
+    /** @var FindingExpander|null */
+    private $expander;
+
+    public function __construct(?FindingExpander $expander = null)
+    {
+        $this->expander = $expander;
+    }
+
     /**
      * Wrap $text in ANSI color codes. Multiple colors combined via pipe,
      * e.g. "bold|red". Pass empty string to skip wrapping.
@@ -134,6 +142,12 @@ final class ReportWriter
         }
 
         if (!(function_exists('stream_isatty') && stream_isatty(STDIN))) {
+            foreach ($buckets as $n => $bucket) {
+                if (empty($bucket['findings'])) {
+                    continue;
+                }
+                $this->renderScenarioDetail($n, $bucket['findings'], $tableResults, $entityResults);
+            }
             echo "\n";
             return false;
         }
@@ -398,6 +412,7 @@ final class ReportWriter
      */
     private function renderScenarioDetail(int $scenario, array $findings, array $tableResults, array $entityResults): void
     {
+        $findings = $this->expandFindings($findings);
         $c   = fn(string $t, string $clr) => self::color($t, $clr);
         $sep = str_repeat('─', 66);
 
@@ -434,6 +449,7 @@ final class ReportWriter
 
     private function saveScenarioToFile(int $scenario, array $findings, array $tableResults, array $entityResults): ?string
     {
+        $findings = $this->expandFindings($findings);
         $lines = [];
         $label = self::SCENARIOS[$scenario]['label'];
         $total = $this->sumRowCounts($findings);
@@ -559,13 +575,16 @@ final class ReportWriter
                 . ($f->rowCount === 1 ? '' : 's') . ')';
         }
         if (Finding::isEntityOrphan($f)) {
-            return $f->pk . ' (' . number_format($f->rowCount) . ' row'
-                . ($f->rowCount === 1 ? '' : 's') . ')';
+            if ($f->rowCount > 1 || strpos((string) $f->pk, '->') !== false) {
+                return $f->pk . ' (' . number_format($f->rowCount) . ' row'
+                    . ($f->rowCount === 1 ? '' : 's') . ')';
+            }
+            return 'Row #' . $f->pk;
         }
         if ($f->reason === Finding::REASON_DELETED_JOURNAL && $f->rowCount > 1) {
             return 'Journal #' . $f->pk . ' (' . number_format($f->rowCount) . ' rows)';
         }
-        if ($f->rowCount > 1) {
+        if ($f->rowCount > 1 && (Finding::isBulk($f) || $f->reason === Finding::REASON_DELETED_JOURNAL)) {
             return 'Aggregate (' . number_format($f->rowCount) . ' rows)';
         }
         if (Finding::isBulk($f)) {
@@ -573,6 +592,18 @@ final class ReportWriter
                 . ($f->rowCount === 1 ? '' : 's') . ')';
         }
         return 'Row #' . $f->pk;
+    }
+
+    /**
+     * @param Finding[] $findings
+     * @return Finding[]
+     */
+    private function expandFindings(array $findings): array
+    {
+        if ($this->expander === null) {
+            return $findings;
+        }
+        return $this->expander->expand($findings);
     }
 
     /** @param Finding[] $findings @return array<string, Finding[]> */

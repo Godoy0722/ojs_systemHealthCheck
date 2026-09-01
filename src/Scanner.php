@@ -62,6 +62,17 @@ final class Scanner
     /** @var Finding[] */
     private array $findings = [];
 
+    /** @var ProgressReporter|null */
+    private $progress = null;
+
+    private const SCENARIO_LOCALE = 'Bad locale tags';
+    private const SCENARIO_ORPHAN = 'Orphaned settings, entities & files';
+    private const SCENARIO_ENTITY_REF = 'Invalid entity references';
+    private const SCENARIO_REQUIRED_NULL = 'Required fields NULL';
+    private const SCENARIO_SETTING_NULL = 'NULL setting_value';
+    private const SCENARIO_REVIEW = 'REVIEW_REVISION files';
+    private const SCENARIO_JOURNAL = 'Deleted journal leftovers';
+
     /** @var IlluminateDatabaseGateway */
     private $gateway;
 
@@ -168,10 +179,13 @@ final class Scanner
         $run = array_fill_keys($checks, true);
 
         $this->findings = [];
+        $this->progress = new ProgressReporter($this->countScanSteps($run));
+        $this->progress->message('Scanning database...');
 
         // Pass A — schema-driven on mapped tables.
         if (!empty($run[self::CHECK_LOCALE])) {
         foreach ($this->schemaMap as $table => $settingNamesSet) {
+            $this->reportStep($table, self::SCENARIO_LOCALE);
             $names = array_keys($settingNamesSet);
             $count = 0;
             $status = 'clean';
@@ -214,6 +228,7 @@ final class Scanner
 
         // Pass B — heuristic on auto-discovered tables not already covered by Pass A.
         foreach ($this->unmappedTables as $table) {
+            $this->reportStep($table, self::SCENARIO_LOCALE);
             $count = 0;
             $status = 'clean';
             $note = '';
@@ -263,14 +278,17 @@ final class Scanner
 
         if (!empty($run[self::CHECK_ORPHAN])) {
             foreach ($this->tableResults as $table => $_r) {
+                $this->reportStep($table, self::SCENARIO_ORPHAN);
                 $this->runOrphanPass($table);
             }
+            $this->reportStep('files', self::SCENARIO_ORPHAN);
             $this->runFilesOrphanPass();
             $this->runEntityOrphanPass();
         }
 
         if (!empty($run[self::CHECK_EMPTY])) {
             foreach ($this->entityMap as $mainTable => $entity) {
+                $this->reportStep($mainTable, self::SCENARIO_REQUIRED_NULL);
                 $this->runRequiredNullPass($mainTable, $entity);
             }
 
@@ -278,11 +296,13 @@ final class Scanner
                 if (!$this->gateway->columnExists($table, 'setting_name')) {
                     continue;
                 }
+                $this->reportStep($table, self::SCENARIO_SETTING_NULL);
                 $this->runSettingValueNullPass($table);
             }
         }
 
         if (!empty($run[self::CHECK_REVIEW])) {
+            $this->reportStep('submission_files', self::SCENARIO_REVIEW);
             $this->runReviewPass();
         }
 
@@ -292,7 +312,50 @@ final class Scanner
 
         $this->finalizeTableResults($run);
 
+        if ($this->progress !== null) {
+            $this->progress->finish('Scan complete.');
+            $this->progress = null;
+        }
+
         return $this->findings;
+    }
+
+    /** @param array<string, true> $run */
+    private function countScanSteps(array $run): int
+    {
+        $total = 0;
+        if (!empty($run[self::CHECK_LOCALE])) {
+            $total += count($this->schemaMap) + count($this->unmappedTables);
+        }
+        if (!empty($run[self::CHECK_ORPHAN])) {
+            $total += count($this->tableResults) + 1 + count(EntityReferenceRegistry::rules());
+        }
+        if (!empty($run[self::CHECK_EMPTY])) {
+            $total += count($this->entityMap);
+            foreach ($this->tableResults as $table => $_r) {
+                if ($this->gateway->columnExists($table, 'setting_name')) {
+                    $total++;
+                }
+            }
+        }
+        if (!empty($run[self::CHECK_REVIEW])) {
+            $total++;
+        }
+        if (!empty($run[self::CHECK_JOURNAL]) && $this->cascadeRegistry !== null) {
+            try {
+                $total += count($this->cascadeRegistry->build());
+            } catch (\Throwable $e) {
+                $total++;
+            }
+        }
+        return max(1, $total);
+    }
+
+    private function reportStep(string $table, string $scenario): void
+    {
+        if ($this->progress !== null) {
+            $this->progress->step($table, $scenario);
+        }
     }
 
     /**
@@ -617,7 +680,9 @@ final class Scanner
     private function runEntityOrphanPass(): void
     {
         $cleaner = new OrphanReferenceCleaner($this->gateway);
-        foreach ($cleaner->scan() as $finding) {
+        foreach ($cleaner->scan(function (string $table): void {
+            $this->reportStep($table, self::SCENARIO_ENTITY_REF);
+        }) as $finding) {
             $this->findings[] = $finding;
         }
         foreach ($cleaner->getWarnings() as $warning) {
@@ -667,10 +732,6 @@ final class Scanner
             $this->warnings[] = $w;
         }
 
-        if (empty($deadIds)) {
-            return;
-        }
-
         $tableCounts = [];
         $planByTable = [];
         foreach ($plan as $planStep) {
@@ -678,6 +739,11 @@ final class Scanner
         }
 
         foreach ($plan as $step) {
+            $this->reportStep($step['table'], self::SCENARIO_JOURNAL);
+            if (empty($deadIds)) {
+                continue;
+            }
+
             $table = $step['table'];
             try {
                 if ($step['source'] === 'journal') {

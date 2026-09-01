@@ -16,6 +16,8 @@
 
 require(dirname(__FILE__) . '/../bootstrap.inc.php');
 
+import('lib.pkp.classes.services.PKPSchemaService');
+
 require_once(dirname(__FILE__) . '/src/Finding.php');
 require_once(dirname(__FILE__) . '/src/SettingsFkRegistry.php');
 require_once(dirname(__FILE__) . '/src/IlluminateDatabaseGateway.php');
@@ -26,12 +28,16 @@ require_once(dirname(__FILE__) . '/src/ReportWriter.php');
 require_once(dirname(__FILE__) . '/src/EntityReferenceRule.php');
 require_once(dirname(__FILE__) . '/src/EntityReferenceRegistry.php');
 require_once(dirname(__FILE__) . '/src/OrphanReferenceCleaner.php');
+require_once(dirname(__FILE__) . '/src/FindingExpander.php');
+require_once(dirname(__FILE__) . '/src/ProgressReporter.php');
 require_once(dirname(__FILE__) . '/src/Fixer.php');
 
 use APP\tools\settingsHealthCheck\src\Finding;
+use APP\tools\settingsHealthCheck\src\FindingExpander;
 use APP\tools\settingsHealthCheck\src\Fixer;
 use APP\tools\settingsHealthCheck\src\IlluminateDatabaseGateway;
 use APP\tools\settingsHealthCheck\src\JournalCascadeRegistry;
+use APP\tools\settingsHealthCheck\src\ProgressReporter;
 use APP\tools\settingsHealthCheck\src\ReportWriter;
 use APP\tools\settingsHealthCheck\src\Scanner;
 use APP\tools\settingsHealthCheck\src\SchemaRegistry;
@@ -104,7 +110,7 @@ class SettingsHealthCheckTool extends CommandLineTool
 
             $cascadeRegistry = new JournalCascadeRegistry($gateway);
             $scanner = new Scanner($gateway, $cascadeRegistry);
-            $writer = new ReportWriter();
+            $writer = new ReportWriter(new FindingExpander($gateway, $cascadeRegistry));
 
             $scanner->initialize($schemaMap, $entityMap);
             $allFindings = $scanner->scan($this->checks);
@@ -153,7 +159,11 @@ class SettingsHealthCheckTool extends CommandLineTool
                     }
 
                     $fixer = new Fixer($gateway, $cascadeRegistry);
+                    $fixProgress = new ProgressReporter($fixer->countFixSteps($findings));
+                    $fixProgress->message('Applying fixes...');
+                    $fixer->setProgress($fixProgress);
                     $fixResult = $fixer->fix($findings);
+                    $fixProgress->finish('Fix pass complete.');
                     $lastPassResult = $fixResult;
                     $this->mergeFixSuccessTotals($totals, $fixResult);
                     foreach ($fixer->getWarnings() as $w) {

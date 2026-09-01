@@ -873,6 +873,90 @@ final class IlluminateDatabaseGateway
     }
 
     /**
+     * @param string $table
+     * @return array{pk:?string,fk:?string}
+     */
+    public function getTableMetaPublic(string $table): array
+    {
+        return $this->getTableMeta($table);
+    }
+
+    public function getTablePrimaryKey(string $table): ?string
+    {
+        return $this->getTableMeta($table)['pk'];
+    }
+
+    public function getTableForeignKey(string $table): ?string
+    {
+        return $this->getTableMeta($table)['fk'];
+    }
+
+    /**
+     * Yields identity values for rows belonging to dead journals on a nested cascade step.
+     *
+     * @param array<string, array{table:string, identity:string, source:string, column:string, parent:?string, assocType:?int, via:string, aggregate:bool}> $planByTable
+     * @param array<int> $deadJournalIds
+     * @return iterable<int|string>
+     */
+    public function findRowIdsByDeadJournalPath(array $step, array $planByTable, array $deadJournalIds): iterable
+    {
+        if (empty($deadJournalIds) || ($step['parent'] ?? null) === null || !empty($step['aggregate'])) {
+            return;
+        }
+
+        $path = $this->buildDeadJournalCascadePath($step, $planByTable);
+        if ($path === null) {
+            return;
+        }
+        $leaf = $path[count($path) - 1];
+        $root = $path[0];
+        if (!$this->tableExists($root['table']) || !$this->tableExists($leaf['table'])
+            || !$this->columnExists($leaf['table'], $leaf['identity'])) {
+            return;
+        }
+
+        try {
+            $leafIdx = count($path) - 1;
+            $leafAlias = 't' . $leafIdx;
+            $query = Capsule::table($root['table'] . ' as t0')
+                ->select($leafAlias . '.' . $leaf['identity'] . ' as id');
+            for ($i = 1; $i < count($path); $i++) {
+                $parent = $path[$i - 1];
+                $child = $path[$i];
+                if (!$this->columnExists($parent['table'], $parent['identity'])
+                    || !$this->columnExists($child['table'], $child['column'])) {
+                    return;
+                }
+                $query->join(
+                    $child['table'] . ' as t' . $i,
+                    't' . ($i - 1) . '.' . $parent['identity'],
+                    '=',
+                    't' . $i . '.' . $child['column']
+                );
+                if ($child['assocType'] !== null) {
+                    $query->where('t' . $i . '.assoc_type', $child['assocType']);
+                }
+            }
+            $query->whereIn('t0.' . $root['column'], $deadJournalIds);
+            if ($root['assocType'] !== null) {
+                $query->where('t0.assoc_type', $root['assocType']);
+            }
+            if ($step['assocType'] !== null && $leafIdx > 0) {
+                $query->where($leafAlias . '.assoc_type', $step['assocType']);
+            }
+            $cursor = $query->orderBy($leafAlias . '.' . $leaf['identity'])->cursor();
+        } catch (\Throwable $e) {
+            return;
+        }
+
+        foreach ($cursor as $row) {
+            if ($row->id !== null) {
+                yield $row->id;
+            }
+        }
+    }
+
+    /**
      * Quick existence check against the Illuminate schema builder. Public
      * because JournalCascadeRegistry verifies its map against the live schema.
      *

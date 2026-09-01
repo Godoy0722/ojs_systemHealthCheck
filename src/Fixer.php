@@ -16,11 +16,21 @@ namespace APP\tools\settingsHealthCheck\src;
 
 final class Fixer
 {
+    private const SCENARIO_RECOVER = 'Recovering entity references';
+    private const SCENARIO_ORPHAN = 'Orphaned settings, entities & files';
+    private const SCENARIO_ENTITY_REF = 'Invalid entity references';
+    private const SCENARIO_LOCALE = 'Bad locale tags';
+    private const SCENARIO_REVIEW = 'REVIEW_REVISION files';
+    private const SCENARIO_JOURNAL = 'Deleted journal leftovers';
+
     /** @var IlluminateDatabaseGateway */
     private $gateway;
 
     /** @var JournalCascadeRegistry|null */
     private $cascadeRegistry;
+
+    /** @var ProgressReporter|null */
+    private $progress = null;
 
     private string $defaultLocale;
 
@@ -33,6 +43,70 @@ final class Fixer
         $this->cascadeRegistry = $cascadeRegistry;
         $locale = $gateway->getSitePrimaryLocale();
         $this->defaultLocale = $locale !== '' ? $locale : 'en';
+    }
+
+    public function setProgress(?ProgressReporter $progress): void
+    {
+        $this->progress = $progress;
+    }
+
+    /**
+     * @param Finding[] $findings
+     */
+    public function countFixSteps(array $findings): int
+    {
+        $steps = 2;
+
+        [$journalFindings, $rest] = $this->partitionFindings($findings);
+
+        if (!empty($journalFindings) && $this->cascadeRegistry !== null) {
+            $journalIds = $this->resolveDeadJournalIds($journalFindings);
+            try {
+                $steps += count($journalIds) * count($this->cascadeRegistry->build());
+            } catch (\Throwable $e) {
+                $steps += count($journalIds);
+            }
+        }
+
+        $fixedBulk = [];
+        $fixedEntityRules = [];
+        foreach ($rest as $finding) {
+            if (!$this->isFixableFinding($finding)) {
+                continue;
+            }
+            if (Finding::isBulk($finding)) {
+                $bulkKey = $finding->table . ':' . $finding->pk;
+                if (isset($fixedBulk[$bulkKey])) {
+                    continue;
+                }
+                $fixedBulk[$bulkKey] = true;
+                $steps++;
+                continue;
+            }
+
+            switch ($finding->reason) {
+                case Finding::REASON_ORPHAN_ENTITY:
+                    if ($finding->table === 'files' && $finding->pk !== 'unreferenced') {
+                        break;
+                    }
+                    if (Finding::isEntityOrphan($finding)) {
+                        $ruleKey = (string) $finding->pk;
+                        if (isset($fixedEntityRules[$ruleKey])) {
+                            break;
+                        }
+                        $fixedEntityRules[$ruleKey] = true;
+                    }
+                    $steps++;
+                    break;
+                case Finding::REASON_SCHEMA_MISSING_LOCALE:
+                case Finding::REASON_HEURISTIC_LOCALE_MISMATCH:
+                case Finding::REASON_REVIEW_REVISION:
+                    $steps++;
+                    break;
+            }
+        }
+
+        return max(1, $steps);
     }
 
     /**
@@ -55,17 +129,11 @@ final class Fixer
         ];
 
         $entityCleaner = new OrphanReferenceCleaner($this->gateway);
-        $result['entityReferencesRecovered'] = $entityCleaner->recoverReferences();
+        $result['entityReferencesRecovered'] = $entityCleaner->recoverReferences(function (string $table): void {
+            $this->reportStep($table, self::SCENARIO_RECOVER);
+        });
 
-        $journalFindings = [];
-        $rest = [];
-        foreach ($findings as $finding) {
-            if ($finding->reason === Finding::REASON_DELETED_JOURNAL) {
-                $journalFindings[] = $finding;
-            } else {
-                $rest[] = $finding;
-            }
-        }
+        [$journalFindings, $rest] = $this->partitionFindings($findings);
 
         if (!empty($journalFindings)) {
             $result['journalRecordsDeleted'] = $this->deleteDeadJournals($journalFindings, $result);
@@ -92,6 +160,7 @@ final class Fixer
                             if ($finding->pk !== 'unreferenced') {
                                 break;
                             }
+                            $this->reportStep('files', self::SCENARIO_ORPHAN);
                             $deleted = $this->gateway->deleteUnreferencedFiles();
                             if ($deleted > 0) {
                                 $result['orphanFilesDeleted'] += $deleted;
@@ -106,6 +175,7 @@ final class Fixer
                                 break;
                             }
                             $fixedEntityRules[$ruleKey] = true;
+                            $this->reportStep($finding->table, self::SCENARIO_ENTITY_REF);
                             $fixed = $entityCleaner->fixFinding($finding);
                             if ($fixed > 0) {
                                 $result['entityOrphansFixed'] += $fixed;
@@ -114,6 +184,7 @@ final class Fixer
                             }
                             break;
                         }
+                        $this->reportStep($finding->table, self::SCENARIO_ORPHAN);
                         $deleted = $this->gateway->deleteSettingRow(
                             $finding->table,
                             $finding->pk,
@@ -131,6 +202,7 @@ final class Fixer
 
                     case Finding::REASON_SCHEMA_MISSING_LOCALE:
                     case Finding::REASON_HEURISTIC_LOCALE_MISMATCH:
+                        $this->reportStep($finding->table, self::SCENARIO_LOCALE);
                         $locale = $finding->suggestedLocale !== '' ? $finding->suggestedLocale : $this->defaultLocale;
                         $updated = $this->gateway->setSettingRowLocale(
                             $finding->table,
@@ -143,6 +215,7 @@ final class Fixer
                         break;
 
                     case Finding::REASON_REVIEW_REVISION:
+                        $this->reportStep('submission_files', self::SCENARIO_REVIEW);
                         $deleted = $this->gateway->deleteReviewRevisionFile($finding->pk);
                         $deleted > 0 ? $result['reviewFilesDeleted'] += $deleted : $result['failed']++;
                         break;
@@ -176,6 +249,7 @@ final class Fixer
     {
         $pk = (string) $finding->pk;
         if (strpos($pk, Finding::BULK_PREFIX . 'orphan:') === 0) {
+            $this->reportStep($finding->table, self::SCENARIO_ORPHAN);
             $parts = explode(':', substr($pk, strlen(Finding::BULK_PREFIX . 'orphan:')));
             if (count($parts) !== 4) {
                 return false;
@@ -196,6 +270,7 @@ final class Fixer
             return true;
         }
         if ($pk === Finding::bulkPk('issueId')) {
+            $this->reportStep($finding->table, self::SCENARIO_ORPHAN);
             $deleted = $this->gateway->deleteInvalidPublicationIssueIdSettings();
             if ($deleted > 0) {
                 $result['orphansDeleted'] += $deleted;
@@ -205,6 +280,7 @@ final class Fixer
             return true;
         }
         if ($pk === Finding::bulkPk('locale-schema') || $pk === Finding::bulkPk('locale-heuristic')) {
+            $this->reportStep($finding->table, self::SCENARIO_LOCALE);
             $names = $finding->entityId !== null && $finding->entityId !== ''
                 ? explode('|', (string) $finding->entityId)
                 : [];
@@ -218,6 +294,7 @@ final class Fixer
             return true;
         }
         if ($pk === Finding::bulkPk('review')) {
+            $this->reportStep('submission_files', self::SCENARIO_REVIEW);
             $deleted = $this->gateway->deleteAllReviewRevisionFiles();
             if ($deleted > 0) {
                 $result['reviewFilesDeleted'] += $deleted;
@@ -241,25 +318,7 @@ final class Fixer
             return 0;
         }
 
-        $journalIds = [];
-        if ($this->cascadeRegistry !== null) {
-            try {
-                foreach ($this->gateway->findDeadJournalIds(
-                    $this->cascadeRegistry->getDirectRootColumns()
-                ) as $journalId) {
-                    $journalIds[(int) $journalId] = true;
-                }
-            } catch (\Throwable $e) {
-                $this->warnings[] = 'Could not resolve dead journal ids: ' . $e->getMessage();
-            }
-        }
-        if (empty($journalIds)) {
-            foreach ($journalFindings as $f) {
-                if ($f->entityId !== null) {
-                    $journalIds[(int) $f->entityId] = true;
-                }
-            }
-        }
+        $journalIds = $this->resolveDeadJournalIds($journalFindings);
 
         $forwardPlan = $this->cascadeRegistry->build();
         $plan = array_reverse($forwardPlan);
@@ -269,11 +328,12 @@ final class Fixer
         }
         $totalDeleted = 0;
 
-        foreach (array_keys($journalIds) as $journalId) {
+        foreach ($journalIds as $journalId) {
             try {
                 $totalDeleted += $this->gateway->runInTransaction(function () use ($plan, $planByTable, $journalId) {
                     $deleted = 0;
                     foreach ($plan as $step) {
+                        $this->reportStep($step['table'], self::SCENARIO_JOURNAL);
                         if ($step['table'] === 'submission_files' && $step['column'] === 'submission_id') {
                             $deleted += $this->gateway->deleteSubmissionFileDependentsForJournal($journalId);
                         }
@@ -300,6 +360,70 @@ final class Fixer
         }
 
         return $totalDeleted;
+    }
+
+    /**
+     * @param Finding[] $findings
+     * @return array{0: Finding[], 1: Finding[]}
+     */
+    private function partitionFindings(array $findings): array
+    {
+        $journalFindings = [];
+        $rest = [];
+        foreach ($findings as $finding) {
+            if ($finding->reason === Finding::REASON_DELETED_JOURNAL) {
+                $journalFindings[] = $finding;
+            } else {
+                $rest[] = $finding;
+            }
+        }
+        return [$journalFindings, $rest];
+    }
+
+    /** @param Finding[] $journalFindings @return int[] */
+    private function resolveDeadJournalIds(array $journalFindings): array
+    {
+        $journalIds = [];
+        if ($this->cascadeRegistry !== null) {
+            try {
+                foreach ($this->gateway->findDeadJournalIds(
+                    $this->cascadeRegistry->getDirectRootColumns()
+                ) as $journalId) {
+                    $journalIds[(int) $journalId] = true;
+                }
+            } catch (\Throwable $e) {
+                $this->warnings[] = 'Could not resolve dead journal ids: ' . $e->getMessage();
+            }
+        }
+        if (empty($journalIds)) {
+            foreach ($journalFindings as $f) {
+                if ($f->entityId !== null) {
+                    $journalIds[(int) $f->entityId] = true;
+                }
+            }
+        }
+        return array_keys($journalIds);
+    }
+
+    private function isFixableFinding(Finding $finding): bool
+    {
+        switch ($finding->reason) {
+            case Finding::REASON_ORPHAN_ENTITY:
+            case Finding::REASON_SCHEMA_MISSING_LOCALE:
+            case Finding::REASON_HEURISTIC_LOCALE_MISMATCH:
+            case Finding::REASON_REVIEW_REVISION:
+            case Finding::REASON_DELETED_JOURNAL:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    private function reportStep(string $table, string $scenario): void
+    {
+        if ($this->progress !== null) {
+            $this->progress->step($table, $scenario);
+        }
     }
 
     /** @return array<string, array<int|string>> */

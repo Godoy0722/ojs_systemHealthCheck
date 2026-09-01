@@ -75,9 +75,17 @@ final class Finding
 
     public static function isEntityOrphan(self $f): bool
     {
-        return $f->reason === self::REASON_ORPHAN_ENTITY
-            && $f->table !== 'files'
-            && strpos((string) $f->pk, '->') !== false;
+        if ($f->reason !== self::REASON_ORPHAN_ENTITY || $f->table === 'files') {
+            return false;
+        }
+        if (strpos((string) $f->pk, '->') !== false) {
+            return true;
+        }
+        return in_array($f->suggestedLocale, [
+            EntityReferenceRule::ACTION_DELETE_REQUIRED,
+            EntityReferenceRule::ACTION_NULLIFY,
+            EntityReferenceRule::ACTION_DELETE_OPTIONAL,
+        ], true);
     }
 
     /** Aggregate finding — fixed with one bulk SQL statement, not row-by-row. */
