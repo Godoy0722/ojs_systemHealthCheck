@@ -45,7 +45,13 @@ final class EntityReferenceRegistry
         $del = EntityReferenceRule::ACTION_DELETE_OPTIONAL;
 
         $rules = [
-            new EntityReferenceRule('submissions', 'current_publication_id', 'publications', 'publication_id', $req, $ctx),
+            // Nullable by schema and recomputable from `publications`, so a dangling
+            // value is repointed by OrphanReferenceCleaner::recoverCurrentPublicationIds()
+            // first and only nullified when the submission has no publication left.
+            // Never deleted: that would remove the submission because its pointer to a
+            // child broke, and NULL is a state OJS itself leaves behind (see
+            // PKPSubmissionService::add(), which inserts the row before any publication).
+            new EntityReferenceRule('submissions', 'current_publication_id', 'publications', 'publication_id', $nil, $ctx),
             new EntityReferenceRule('submission_files', 'submission_id', 'submissions', 'submission_id', $req, $sub),
             new EntityReferenceRule('submission_files', 'file_id', 'files', 'file_id', $req, $sub),
             new EntityReferenceRule('submission_files', 'uploader_user_id', 'users', 'user_id', $nil, $sub),

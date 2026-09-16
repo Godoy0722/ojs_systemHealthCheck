@@ -17,6 +17,7 @@
 require(dirname(__FILE__) . '/../bootstrap.inc.php');
 
 import('lib.pkp.classes.services.PKPSchemaService');
+import('lib.pkp.classes.submission.PKPSubmission'); // for STATUS_PUBLISHED
 
 require_once(dirname(__FILE__) . '/src/Finding.php');
 require_once(dirname(__FILE__) . '/src/SettingsFkRegistry.php');

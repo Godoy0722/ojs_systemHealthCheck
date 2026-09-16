@@ -61,6 +61,7 @@ final class OrphanReferenceCleaner
             if (!$this->validateRule($rule)) {
                 continue;
             }
+            $this->appendMissingRequiredReference($rule, $findings);
             try {
                 $count = (int) $this->buildInvalidReferenceQuery($rule, $live)->count();
             } catch (\Throwable $e) {
@@ -84,6 +85,49 @@ final class OrphanReferenceCleaner
         }
 
         return $findings;
+    }
+
+    /**
+     * Reports NULLs in a reference column the live schema declares NOT NULL.
+     *
+     * Such a row is corrupt but it is not a leftover of a deleted parent, so the
+     * dangling-reference query excludes it and no fix is offered. The count is
+     * site-wide: a row whose scoping reference is itself NULL cannot be attributed
+     * to a journal. Columns declared nullable are skipped — NULL is a legitimate
+     * value there, and Pass D1 already covers the schema-required ones.
+     *
+     * @param Finding[] $findings
+     */
+    private function appendMissingRequiredReference(EntityReferenceRule $rule, array &$findings): void
+    {
+        if ($rule->action !== EntityReferenceRule::ACTION_DELETE_REQUIRED) {
+            return;
+        }
+        if (!empty($this->gateway->filterNullableColumns($rule->sourceTable, [$rule->sourceColumn]))) {
+            return;
+        }
+        try {
+            $count = (int) Capsule::table($rule->sourceTable)
+                ->whereNull($rule->sourceColumn)
+                ->count();
+        } catch (\Throwable $e) {
+            $this->warnings[] = sprintf('Pass H (NULL check) failed for %s: %s', $rule->ruleKey(), $e->getMessage());
+            return;
+        }
+        if ($count <= 0) {
+            return;
+        }
+        $findings[] = new Finding(
+            $rule->sourceTable,
+            Finding::bulkPk('required-null-ref', $rule->sourceColumn),
+            null,
+            $rule->sourceColumn,
+            null,
+            null,
+            Finding::REASON_REQUIRED_NULL,
+            '',
+            $count
+        );
     }
 
     /**
@@ -182,11 +226,22 @@ final class OrphanReferenceCleaner
         foreach ($this->invalidCurrentPublicationQuery()->select('s.submission_id', 's.current_publication_id')->get() as $row) {
             $submissionId = (int) $row->submission_id;
             try {
+                // Same precedence as PKPSubmissionService::updateStatus(): the latest
+                // published publication, falling back to the latest of any status.
+                // Ordering by publication_id alone can demote a published article to a
+                // newer unpublished draft.
                 $newId = Capsule::table('publications')
                     ->where('submission_id', '=', $submissionId)
+                    ->orderByRaw('CASE WHEN status = ? THEN 0 ELSE 1 END', [STATUS_PUBLISHED])
                     ->orderByDesc('publication_id')
                     ->value('publication_id');
                 if ($newId === null) {
+                    $this->warnings[] = sprintf(
+                        'Submission %d points at missing publication %s and has no publication left;'
+                        . ' OJS requires at least one. Needs manual review.',
+                        $submissionId,
+                        (string) $row->current_publication_id
+                    );
                     continue;
                 }
                 $newId = (int) $newId;
@@ -254,9 +309,6 @@ final class OrphanReferenceCleaner
             ->values()
             ->all();
 
-        if ($rule->action === EntityReferenceRule::ACTION_DELETE_REQUIRED) {
-            return $this->deleteByColumnValues($rule, $ids, true);
-        }
         if (empty($ids)) {
             return 0;
         }
@@ -269,20 +321,12 @@ final class OrphanReferenceCleaner
             }
             return $updated;
         }
-        return $this->deleteByColumnValues($rule, $ids, false);
+        return $this->deleteByColumnValues($rule, $ids);
     }
 
-    private function deleteByColumnValues(EntityReferenceRule $rule, array $ids, bool $includeNull): int
+    private function deleteByColumnValues(EntityReferenceRule $rule, array $ids): int
     {
         $deleted = 0;
-        if ($includeNull) {
-            $deleted += (int) Capsule::table($rule->sourceTable)
-                ->whereNull($rule->sourceColumn)
-                ->delete();
-        }
-        if (empty($ids)) {
-            return $deleted;
-        }
         foreach (array_chunk($ids, self::ID_CHUNK) as $chunk) {
             $deleted += (int) Capsule::table($rule->sourceTable)
                 ->whereIn($rule->sourceColumn, $chunk)
@@ -293,6 +337,9 @@ final class OrphanReferenceCleaner
 
     private function buildInvalidReferenceQuery(EntityReferenceRule $rule, array $liveJournalIds)
     {
+        // A NULL source column means "no reference", which cannot be a leftover of a
+        // deleted parent. Only a value that points at a missing row is in scope here;
+        // NULLs are reported by appendMissingRequiredReference() and never fixed.
         $query = Capsule::table($rule->sourceTable . ' as s')
             ->leftJoin(
                 $rule->referenceTable . ' as r',
@@ -300,11 +347,9 @@ final class OrphanReferenceCleaner
                 '=',
                 'r.' . $rule->referenceColumn
             )
-            ->whereNull('r.' . $rule->referenceColumn);
+            ->whereNull('r.' . $rule->referenceColumn)
+            ->whereNotNull('s.' . $rule->sourceColumn);
 
-        if ($rule->action !== EntityReferenceRule::ACTION_DELETE_REQUIRED) {
-            $query->whereNotNull('s.' . $rule->sourceColumn);
-        }
         if ($rule->ignoreZero) {
             $query->where('s.' . $rule->sourceColumn, '!=', 0);
         }
@@ -313,18 +358,19 @@ final class OrphanReferenceCleaner
         return $query;
     }
 
+    /**
+     * Submissions in a live journal whose current_publication_id points at a
+     * publication that no longer exists. Submissions with no publication at all are
+     * intentionally included so recoverCurrentPublicationIds() can report them; it
+     * skips them for repointing, since there is nothing to repoint to.
+     */
     private function invalidCurrentPublicationQuery()
     {
         return Capsule::table('submissions as s')
             ->join('journals as j', 'j.journal_id', '=', 's.context_id')
             ->leftJoin('publications as p', 'p.publication_id', '=', 's.current_publication_id')
             ->whereNotNull('s.current_publication_id')
-            ->whereNull('p.publication_id')
-            ->whereExists(function ($q) {
-                $q->from('publications as p2')
-                    ->whereColumn('p2.submission_id', '=', 's.submission_id')
-                    ->selectRaw('1');
-            });
+            ->whereNull('p.publication_id');
     }
 
     private function invalidSectionQuery()
