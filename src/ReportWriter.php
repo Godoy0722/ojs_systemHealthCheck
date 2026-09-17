@@ -175,7 +175,7 @@ final class ReportWriter
             }
             $buckets[$scenario]['findings'][] = $f;
             $table = $f->table;
-            $buckets[$scenario]['tables'][$table] = ($buckets[$scenario]['tables'][$table] ?? 0) + $f->rowCount;
+            $buckets[$scenario]['tables'][$table] = ($buckets[$scenario]['tables'][$table] ?? 0) + Finding::statCount($f);
         }
         return $buckets;
     }
@@ -189,7 +189,7 @@ final class ReportWriter
     {
         $total = 0;
         foreach ($findings as $finding) {
-            $total += $finding->rowCount;
+            $total += Finding::statCount($finding);
         }
         return $total;
     }
@@ -412,15 +412,20 @@ final class ReportWriter
      */
     private function renderScenarioDetail(int $scenario, array $findings, array $tableResults, array $entityResults): void
     {
-        $findings = $this->expandFindings($findings);
         $c   = fn(string $t, string $clr) => self::color($t, $clr);
         $sep = str_repeat('─', 66);
 
         $label = self::SCENARIOS[$scenario]['label'];
         $total = $this->sumRowCounts($findings);
-
         $byTable = $this->groupFindingsByTable($findings);
         $nTables = count($byTable);
+        $tableUnique = [];
+        foreach ($byTable as $table => $rows) {
+            $tableUnique[$table] = $this->sumRowCounts($rows);
+        }
+
+        $findings = $this->expandFindings($findings);
+        $byTable = $this->groupFindingsByTable($findings);
 
         echo $c($sep, 'cyan') . "\n";
         echo '  ' . $c("Scenario {$scenario}: {$label}", 'bold') . "\n";
@@ -428,7 +433,7 @@ final class ReportWriter
         echo $c($sep, 'cyan') . "\n\n";
 
         foreach ($byTable as $table => $rows) {
-            $rowCount = $this->sumRowCounts($rows);
+            $rowCount = $tableUnique[$table] ?? $this->sumRowCounts($rows);
             $fkInfo = $this->parseFk($tableResults[$table]['orphanFk'] ?? null);
 
             echo '  ' . $c("▸ {$table}", 'bold|magenta') .
@@ -449,21 +454,26 @@ final class ReportWriter
 
     private function saveScenarioToFile(int $scenario, array $findings, array $tableResults, array $entityResults): ?string
     {
-        $findings = $this->expandFindings($findings);
         $lines = [];
         $label = self::SCENARIOS[$scenario]['label'];
         $total = $this->sumRowCounts($findings);
+        $byTable = $this->groupFindingsByTable($findings);
+        $tableUnique = [];
+        foreach ($byTable as $table => $rows) {
+            $tableUnique[$table] = $this->sumRowCounts($rows);
+        }
+        $findings = $this->expandFindings($findings);
         $byTable = $this->groupFindingsByTable($findings);
         $sep = str_repeat('─', 66);
 
         $lines[] = $sep;
         $lines[] = "Scenario {$scenario}: {$label}";
-        $lines[] = "{$total} record" . ($total === 1 ? '' : 's') . ' across ' . count($byTable) . ' table' . (count($byTable) === 1 ? '' : 's');
+        $lines[] = "{$total} record" . ($total === 1 ? '' : 's') . ' across ' . count($tableUnique) . ' table' . (count($tableUnique) === 1 ? '' : 's');
         $lines[] = $sep;
         $lines[] = '';
 
         foreach ($byTable as $table => $rows) {
-            $rowCount = $this->sumRowCounts($rows);
+            $rowCount = $tableUnique[$table] ?? $this->sumRowCounts($rows);
             $fkInfo = $this->parseFk($tableResults[$table]['orphanFk'] ?? null);
             $lines[] = '▸ ' . $table . '  (' . $rowCount . ' record' . ($rowCount === 1 ? ')' : 's') . ')';
             $lines[] = '';

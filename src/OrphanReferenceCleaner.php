@@ -53,6 +53,7 @@ final class OrphanReferenceCleaner
     {
         $findings = [];
         $live = $this->getLiveJournalIds();
+        $claimed = [];
 
         foreach (EntityReferenceRegistry::rules() as $rule) {
             if ($onRule !== null) {
@@ -71,7 +72,7 @@ final class OrphanReferenceCleaner
             if ($count <= 0) {
                 continue;
             }
-            $findings[] = new Finding(
+            $finding = new Finding(
                 $rule->sourceTable,
                 $rule->ruleKey(),
                 null,
@@ -82,6 +83,15 @@ final class OrphanReferenceCleaner
                 $rule->action,
                 $count
             );
+            $identities = $this->collectInvalidIdentities($rule, $live);
+            if (!empty($identities)) {
+                $finding->uniqueRowCount = Finding::claimIdentities(
+                    $claimed,
+                    $rule->sourceTable,
+                    $identities
+                );
+            }
+            $findings[] = $finding;
         }
 
         return $findings;
@@ -298,41 +308,126 @@ final class OrphanReferenceCleaner
         return $updated;
     }
 
+    /**
+     * Deletes or nullifies the same rows the scan counted: scoped query, then
+     * write by the source table's primary key. Never round-trips through the
+     * invalid FK value, which would also hit dead-journal rows the scan hid.
+     */
     private function fixInvalidReferences(EntityReferenceRule $rule, array $liveJournalIds): int
     {
-        $ids = $this->buildInvalidReferenceQuery($rule, $liveJournalIds)
-            ->distinct()
-            ->pluck('s.' . $rule->sourceColumn)
-            ->filter(function ($id) {
-                return $id !== null;
-            })
-            ->values()
-            ->all();
-
-        if (empty($ids)) {
+        $identities = $this->collectInvalidIdentities($rule, $liveJournalIds);
+        if (empty($identities)) {
             return 0;
         }
+
         if ($rule->action === EntityReferenceRule::ACTION_NULLIFY) {
-            $updated = 0;
-            foreach (array_chunk($ids, self::ID_CHUNK) as $chunk) {
-                $updated += (int) Capsule::table($rule->sourceTable)
-                    ->whereIn($rule->sourceColumn, $chunk)
-                    ->update([$rule->sourceColumn => null]);
-            }
-            return $updated;
+            return $this->updateRowsByIdentity($rule->sourceTable, $identities, [$rule->sourceColumn => null]);
         }
-        return $this->deleteByColumnValues($rule, $ids);
+        return $this->deleteRowsByIdentity($rule->sourceTable, $identities);
     }
 
-    private function deleteByColumnValues(EntityReferenceRule $rule, array $ids): int
+    /**
+     * Primary-key tuples for rows matching the scoped invalid-reference query.
+     *
+     * @return array<int, array<string, mixed>>
+     */
+    private function collectInvalidIdentities(EntityReferenceRule $rule, array $liveJournalIds): array
+    {
+        $pkCols = $this->gateway->getPrimaryKeyColumns($rule->sourceTable);
+        if (empty($pkCols)) {
+            $this->warnings[] = sprintf(
+                'Pass H cannot identify rows for %s: table %s has no primary key',
+                $rule->ruleKey(),
+                $rule->sourceTable
+            );
+            return [];
+        }
+
+        $select = [];
+        foreach ($pkCols as $col) {
+            $select[] = 's.' . $col . ' as ' . $col;
+        }
+
+        try {
+            $rows = $this->buildInvalidReferenceQuery($rule, $liveJournalIds)
+                ->select($select)
+                ->distinct()
+                ->get();
+        } catch (\Throwable $e) {
+            $this->warnings[] = sprintf('Pass H identity query failed for %s: %s', $rule->ruleKey(), $e->getMessage());
+            return [];
+        }
+
+        $identities = [];
+        foreach ($rows as $row) {
+            $tuple = [];
+            $skip = false;
+            foreach ($pkCols as $col) {
+                $value = is_object($row) ? ($row->{$col} ?? $row->{strtoupper($col)} ?? null) : null;
+                if ($value === null) {
+                    $skip = true;
+                    break;
+                }
+                $tuple[$col] = $value;
+            }
+            if (!$skip) {
+                $identities[] = $tuple;
+            }
+        }
+        return $identities;
+    }
+
+    /**
+     * @param array<int, array<string, mixed>> $identities
+     */
+    private function deleteRowsByIdentity(string $table, array $identities): int
     {
         $deleted = 0;
-        foreach (array_chunk($ids, self::ID_CHUNK) as $chunk) {
-            $deleted += (int) Capsule::table($rule->sourceTable)
-                ->whereIn($rule->sourceColumn, $chunk)
-                ->delete();
+        foreach (array_chunk($identities, self::ID_CHUNK) as $chunk) {
+            $deleted += (int) $this->identityQuery($table, $chunk)->delete();
         }
         return $deleted;
+    }
+
+    /**
+     * @param array<int, array<string, mixed>> $identities
+     * @param array<string, mixed> $values
+     */
+    private function updateRowsByIdentity(string $table, array $identities, array $values): int
+    {
+        $updated = 0;
+        foreach (array_chunk($identities, self::ID_CHUNK) as $chunk) {
+            $updated += (int) $this->identityQuery($table, $chunk)->update($values);
+        }
+        return $updated;
+    }
+
+    /**
+     * @param array<int, array<string, mixed>> $chunk
+     * @return \Illuminate\Database\Query\Builder
+     */
+    private function identityQuery(string $table, array $chunk)
+    {
+        $query = Capsule::table($table);
+        $pkCols = array_keys($chunk[0]);
+        if (count($pkCols) === 1) {
+            $col = $pkCols[0];
+            $ids = [];
+            foreach ($chunk as $tuple) {
+                $ids[] = $tuple[$col];
+            }
+            return $query->whereIn($col, $ids);
+        }
+        $query->where(function ($q) use ($chunk) {
+            foreach ($chunk as $tuple) {
+                $q->orWhere(function ($q2) use ($tuple) {
+                    foreach ($tuple as $col => $val) {
+                        $q2->where($col, $val);
+                    }
+                });
+            }
+        });
+        return $query;
     }
 
     private function buildInvalidReferenceQuery(EntityReferenceRule $rule, array $liveJournalIds)

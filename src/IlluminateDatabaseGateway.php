@@ -47,6 +47,9 @@ final class IlluminateDatabaseGateway
     /** @var array<string, array{pk:?string, fk:?string}> */
     private array $tableMetaCache = [];
 
+    /** @var array<string, string[]> information_schema PRI columns, same cache lifetime as tableMetaCache. */
+    private array $primaryKeyColumnsCache = [];
+
     /**
      * Returns the current connection's database name. Falls back to the OJS
      * config when the Capsule manager reports an empty string.
@@ -438,6 +441,25 @@ final class IlluminateDatabaseGateway
     }
 
     /**
+     * Distinct primary-key tuples for orphan settings rows of one FK.
+     *
+     * @return array<int, array<string, mixed>>
+     */
+    public function findOrphanRowIdentities(
+        string $settingsTable,
+        string $fkCol,
+        string $parentTable,
+        string $parentCol,
+        bool $ignoreZero = false
+    ): array {
+        $query = $this->buildOrphanQuery($settingsTable, $fkCol, $parentTable, $parentCol, $ignoreZero);
+        if ($query === null) {
+            return [];
+        }
+        return $this->fetchAliasedPrimaryKeyTuples($settingsTable, $query, 's');
+    }
+
+    /**
      * Deletes all orphan settings rows for one FK in a single statement.
      */
     public function deleteOrphanSettings(
@@ -693,6 +715,31 @@ final class IlluminateDatabaseGateway
         }
     }
 
+    /**
+     * Distinct publication_settings primary keys for invalid issueId rows.
+     *
+     * @return array<int, array<string, mixed>>
+     */
+    public function findInvalidPublicationIssueIdIdentities(): array
+    {
+        if (!$this->tableExists('publication_settings')
+            || !$this->tableExists('publications')
+            || !$this->tableExists('issues')
+        ) {
+            return [];
+        }
+        try {
+            $query = Capsule::table('publications as p')
+                ->join('publication_settings as ps', 'ps.publication_id', '=', 'p.publication_id')
+                ->leftJoin('issues as i', Capsule::raw('CAST(i.issue_id AS CHAR(20))'), '=', 'ps.setting_value')
+                ->where('ps.setting_name', 'issueId')
+                ->whereNull('i.issue_id');
+        } catch (\Throwable $e) {
+            return [];
+        }
+        return $this->fetchAliasedPrimaryKeyTuples('publication_settings', $query, 'ps');
+    }
+
     public function deleteInvalidPublicationIssueIdSettings(): int
     {
         if (!$this->tableExists('publication_settings')
@@ -886,6 +933,102 @@ final class IlluminateDatabaseGateway
         return $this->getTableMeta($table)['pk'];
     }
 
+    /**
+     * Every column that information_schema marks as PRI, in ordinal order.
+     * Composite keys return every part — unlike getTablePrimaryKey(), which
+     * collapses a composite to a single guessed column and is not unique.
+     *
+     * @return string[]
+     */
+    public function getPrimaryKeyColumns(string $table): array
+    {
+        $this->getTableMeta($table);
+        if (!empty($this->primaryKeyColumnsCache[$table])) {
+            return $this->primaryKeyColumnsCache[$table];
+        }
+        $pk = $this->tableMetaCache[$table]['pk'] ?? null;
+        return $pk !== null && $pk !== '' ? [$pk] : [];
+    }
+
+    /**
+     * Columns of the widest UNIQUE index, in key order. Empty when the table
+     * has none (or information_schema is unavailable).
+     *
+     * @return string[]
+     */
+    private function getUniqueIndexColumns(string $table): array
+    {
+        $db = $this->getDatabaseName();
+        if ($db === '') {
+            return [];
+        }
+        try {
+            $rows = Capsule::select(
+                'SELECT index_name AS idx, column_name AS name'
+                . ' FROM information_schema.statistics'
+                . ' WHERE table_schema = ? AND table_name = ? AND non_unique = 0'
+                . ' ORDER BY index_name, seq_in_index',
+                [$db, $table]
+            );
+        } catch (\Throwable $e) {
+            return [];
+        }
+        $byIndex = [];
+        foreach ($rows as $r) {
+            $idx = is_object($r) ? (string) ($r->idx ?? $r->IDX ?? '') : '';
+            $name = is_object($r) ? (string) ($r->name ?? $r->NAME ?? '') : '';
+            if ($idx === '' || $name === '') {
+                continue;
+            }
+            $byIndex[$idx][] = $name;
+        }
+        $best = [];
+        foreach ($byIndex as $cols) {
+            if (count($cols) > count($best)) {
+                $best = $cols;
+            }
+        }
+        return $best;
+    }
+
+    /**
+     * @param \Illuminate\Database\Query\Builder $query
+     * @return array<int, array<string, mixed>>
+     */
+    private function fetchAliasedPrimaryKeyTuples(string $table, $query, string $alias): array
+    {
+        $pkCols = $this->getPrimaryKeyColumns($table);
+        if (empty($pkCols)) {
+            return [];
+        }
+        $select = [];
+        foreach ($pkCols as $col) {
+            $select[] = $alias . '.' . $col . ' as ' . $col;
+        }
+        try {
+            $rows = $query->select($select)->distinct()->get();
+        } catch (\Throwable $e) {
+            return [];
+        }
+        $identities = [];
+        foreach ($rows as $row) {
+            $tuple = [];
+            $skip = false;
+            foreach ($pkCols as $col) {
+                $value = is_object($row) ? ($row->{$col} ?? $row->{strtoupper($col)} ?? null) : null;
+                if ($value === null) {
+                    $skip = true;
+                    break;
+                }
+                $tuple[$col] = $value;
+            }
+            if (!$skip) {
+                $identities[] = $tuple;
+            }
+        }
+        return $identities;
+    }
+
     public function getTableForeignKey(string $table): ?string
     {
         return $this->getTableMeta($table)['fk'];
@@ -1016,6 +1159,13 @@ final class IlluminateDatabaseGateway
             }
         }
 
+        // OJS 3.3 settings tables often have a UNIQUE KEY and no PRIMARY KEY.
+        // information_schema then leaves COLUMN_KEY empty/MUL; the unique index
+        // is still the row identity used to de-duplicate multi-FK counts.
+        if (empty($priNames)) {
+            $priNames = $this->getUniqueIndexColumns($table);
+        }
+
         $pk = null;
         $fk = null;
 
@@ -1055,6 +1205,7 @@ final class IlluminateDatabaseGateway
             }
         }
 
+        $this->primaryKeyColumnsCache[$table] = $priNames;
         return $this->tableMetaCache[$table] = ['pk' => $pk, 'fk' => $fk];
     }
 

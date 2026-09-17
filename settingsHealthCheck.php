@@ -281,10 +281,10 @@ class SettingsHealthCheckTool extends CommandLineTool
         foreach ($findings as $f) {
             switch ($f->reason) {
                 case Finding::REASON_REVIEW_REVISION:
-                    $counts['review'] += $f->rowCount;
+                    $counts['review'] += Finding::statCount($f);
                     break;
                 case Finding::REASON_DELETED_JOURNAL:
-                    $counts['journalRows'] += $f->rowCount;
+                    $counts['journalRows'] += Finding::statCount($f);
                     if ($f->entityId !== null) {
                         $counts['journalIds'][(int) $f->entityId] = true;
                     } elseif (preg_match('/^(\d+) dead journal/', $f->valuePreview, $m)) {
@@ -293,9 +293,9 @@ class SettingsHealthCheckTool extends CommandLineTool
                     break;
                 case Finding::REASON_ORPHAN_ENTITY:
                     if ($f->table === 'files') {
-                        $counts['orphanFiles'] += $f->rowCount;
+                        $counts['orphanFiles'] += Finding::statCount($f);
                     } elseif (Finding::isEntityOrphan($f)) {
-                        $counts['entityOrphans'] += $f->rowCount;
+                        $counts['entityOrphans'] += Finding::statCount($f);
                     }
                     break;
             }
@@ -332,7 +332,7 @@ class SettingsHealthCheckTool extends CommandLineTool
         $total = 0;
         foreach ($findings as $f) {
             if ($this->isFixableFinding($f)) {
-                $total += $f->rowCount;
+                $total += Finding::statCount($f);
             }
         }
         return $total;
@@ -378,7 +378,7 @@ class SettingsHealthCheckTool extends CommandLineTool
         $total = 0;
         foreach ($findings as $f) {
             if (!$this->isFixableFinding($f)) {
-                $total += $f->rowCount;
+                $total += Finding::statCount($f);
             }
         }
         return $total;

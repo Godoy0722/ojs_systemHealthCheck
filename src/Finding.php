@@ -46,6 +46,15 @@ final class Finding
     /** @var int Aggregate row count (defaults to 1). */
     public $rowCount;
 
+    /**
+     * Rows this finding newly contributes to scenario totals after de-duplicating
+     * the same physical row claimed by another FK rule on the same table.
+     * Defaults to $rowCount.
+     *
+     * @var int
+     */
+    public $uniqueRowCount;
+
     public function __construct(
         string $table,
         $pk,
@@ -69,6 +78,53 @@ final class Finding
         $this->reason = $reason;
         $this->suggestedLocale = $suggestedLocale;
         $this->rowCount = $rowCount > 0 ? $rowCount : 1;
+        $this->uniqueRowCount = $this->rowCount;
+    }
+
+    /** Count used in summaries, confirmations, and fix-loop remaining. */
+    public static function statCount(self $f): int
+    {
+        return $f->uniqueRowCount;
+    }
+
+    /**
+     * Marks previously unseen primary-key tuples for $table and returns how
+     * many of $identities are new. Two FK rules on the same physical row
+     * contribute once to scenario totals; each rule still keeps its own rowCount.
+     *
+     * @param array<string, array<string, true>> $claimed
+     * @param array<int, array<string, mixed>> $identities
+     */
+    public static function claimIdentities(array &$claimed, string $table, array $identities): int
+    {
+        if (!isset($claimed[$table])) {
+            $claimed[$table] = [];
+        }
+        $unique = 0;
+        foreach ($identities as $tuple) {
+            $hash = self::identityHash($tuple);
+            if ($hash === '') {
+                continue;
+            }
+            if (!isset($claimed[$table][$hash])) {
+                $claimed[$table][$hash] = true;
+                $unique++;
+            }
+        }
+        return $unique;
+    }
+
+    /**
+     * @param array<string, mixed> $tuple
+     */
+    public static function identityHash(array $tuple): string
+    {
+        ksort($tuple);
+        $parts = [];
+        foreach ($tuple as $col => $val) {
+            $parts[] = $col . '=' . (string) $val;
+        }
+        return implode("\0", $parts);
     }
 
     public const BULK_PREFIX = 'bulk:';

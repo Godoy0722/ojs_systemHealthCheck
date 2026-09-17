@@ -505,6 +505,7 @@ final class Scanner
         $orphanStatus = 'clean';
         $orphanCount = 0;
         $orphanFk = null;
+        $claimed = [];
         try {
             $foreignKeys = $this->gateway->getForeignKeys($table);
             if (empty($foreignKeys)) {
@@ -523,8 +524,7 @@ final class Scanner
                         $ignoreZero
                     );
                     if ($fkCount > 0) {
-                        $orphanCount += $fkCount;
-                        $this->findings[] = new Finding(
+                        $finding = new Finding(
                             $table,
                             Finding::bulkPk('orphan', sprintf(
                                 '%s:%s:%s:%s',
@@ -541,6 +541,18 @@ final class Scanner
                             '',
                             $fkCount
                         );
+                        $identities = $this->gateway->findOrphanRowIdentities(
+                            $table,
+                            $fk['column'],
+                            $fk['parentTable'],
+                            $fk['parentColumn'],
+                            $ignoreZero
+                        );
+                        if (!empty($identities)) {
+                            $finding->uniqueRowCount = Finding::claimIdentities($claimed, $table, $identities);
+                        }
+                        $orphanCount += $finding->uniqueRowCount;
+                        $this->findings[] = $finding;
                     }
                 }
                 $orphanFk = implode('; ', $fkLabels);
@@ -548,8 +560,7 @@ final class Scanner
             if ($table === 'publication_settings') {
                 $issueCount = $this->gateway->countInvalidPublicationIssueIdSettings();
                 if ($issueCount > 0) {
-                    $orphanCount += $issueCount;
-                    $this->findings[] = new Finding(
+                    $finding = new Finding(
                         $table,
                         Finding::bulkPk('issueId'),
                         null,
@@ -560,6 +571,12 @@ final class Scanner
                         '',
                         $issueCount
                     );
+                    $identities = $this->gateway->findInvalidPublicationIssueIdIdentities();
+                    if (!empty($identities)) {
+                        $finding->uniqueRowCount = Finding::claimIdentities($claimed, $table, $identities);
+                    }
+                    $orphanCount += $finding->uniqueRowCount;
+                    $this->findings[] = $finding;
                 }
                 if ($orphanCount > 0 && $orphanFk === null) {
                     $orphanFk = 'setting_value -> issues(issue_id) (issueId)';
