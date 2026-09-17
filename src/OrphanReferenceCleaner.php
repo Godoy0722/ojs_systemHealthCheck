@@ -141,6 +141,39 @@ final class OrphanReferenceCleaner
     }
 
     /**
+     * Rows recoverReferences() would actually UPDATE: dangling current_publication_id
+     * that still has a publication to repoint to, and dangling section_id whose
+     * journal still has an active section.
+     *
+     * @return array{currentPublication:int, section:int}
+     */
+    public function countRecoverableReferences(): array
+    {
+        $counts = ['currentPublication' => 0, 'section' => 0];
+        if ($this->tablesExist(['submissions', 'publications', 'journals'])) {
+            try {
+                $counts['currentPublication'] = (int) $this->invalidCurrentPublicationQuery()
+                    ->whereExists(function ($q) {
+                        $q->from('publications as rec_p')
+                            ->whereColumn('rec_p.submission_id', '=', 's.submission_id')
+                            ->selectRaw('1');
+                    })
+                    ->count();
+            } catch (\Throwable $e) {
+                $this->warnings[] = sprintf('Pass H (recover count) failed for current_publication_id: %s', $e->getMessage());
+            }
+        }
+        if ($this->tablesExist(['publications', 'submissions', 'sections', 'journals'])) {
+            try {
+                $counts['section'] = (int) $this->invalidSectionQuery()->count();
+            } catch (\Throwable $e) {
+                $this->warnings[] = sprintf('Pass H (recover count) failed for section_id: %s', $e->getMessage());
+            }
+        }
+        return $counts;
+    }
+
+    /**
      * Repoint current_publication_id and section_id before destructive fixes.
      *
      * @param callable(string):void|null $onStep Called with table name before each recovery pass.

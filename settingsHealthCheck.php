@@ -38,6 +38,7 @@ use APP\tools\settingsHealthCheck\src\FindingExpander;
 use APP\tools\settingsHealthCheck\src\Fixer;
 use APP\tools\settingsHealthCheck\src\IlluminateDatabaseGateway;
 use APP\tools\settingsHealthCheck\src\JournalCascadeRegistry;
+use APP\tools\settingsHealthCheck\src\OrphanReferenceCleaner;
 use APP\tools\settingsHealthCheck\src\ProgressReporter;
 use APP\tools\settingsHealthCheck\src\ReportWriter;
 use APP\tools\settingsHealthCheck\src\Scanner;
@@ -130,7 +131,7 @@ class SettingsHealthCheckTool extends CommandLineTool
             $applyFix = $writer->renderInteractive($context, $this->fix);
 
             if ($applyFix) {
-                $this->confirmDestructiveFixes($allFindings);
+                $this->confirmDestructiveFixes($allFindings, $gateway);
 
                 $totals = [
                     'orphansDeleted' => 0,
@@ -275,7 +276,7 @@ class SettingsHealthCheckTool extends CommandLineTool
 	}
 
     /** @param Finding[] $findings */
-    private function confirmDestructiveFixes(array $findings): void
+    private function confirmDestructiveFixes(array $findings, IlluminateDatabaseGateway $gateway): void
     {
         $counts = ['review' => 0, 'journalRows' => 0, 'journalIds' => [], 'journalIdCount' => 0, 'orphanFiles' => 0, 'entityOrphans' => 0];
         foreach ($findings as $f) {
@@ -301,6 +302,23 @@ class SettingsHealthCheckTool extends CommandLineTool
             }
         }
 
+        $recoverPub = 0;
+        $recoverSec = 0;
+        if ($counts['entityOrphans'] > 0) {
+            $recover = (new OrphanReferenceCleaner($gateway))->countRecoverableReferences();
+            $recoverPub = $recover['currentPublication'];
+            $recoverSec = $recover['section'];
+        }
+        $entityLines = [
+            "WARNING: {$counts['entityOrphans']} entity row(s) with invalid references in live journals.",
+        ];
+        if ($recoverPub + $recoverSec > 0) {
+            $entityLines[] = "Fixing will first repoint {$recoverPub} current_publication_id value(s) and {$recoverSec} section_id value(s),";
+            $entityLines[] = 'then DELETE or SET NULL the remaining invalid references.';
+        } else {
+            $entityLines[] = 'Rows will be DELETED or SET NULL. No current_publication_id/section_id repointing is needed.';
+        }
+
         foreach ([
             [$counts['review'], [
                 "WARNING: {$counts['review']} file(s) under REVIEW_REVISION.",
@@ -315,10 +333,7 @@ class SettingsHealthCheckTool extends CommandLineTool
                 "WARNING: {$counts['orphanFiles']} unreferenced blob file(s) in the files table.",
                 'Fixing will delete those files from disk and the database.',
             ]],
-            [$counts['entityOrphans'], [
-                "WARNING: {$counts['entityOrphans']} entity row(s) with invalid references in live journals.",
-                'Rows will be DELETED or SET NULL after repointing current_publication_id/section_id.',
-            ]],
+            [$counts['entityOrphans'], $entityLines],
         ] as [$n, $lines]) {
             if ($n > 0) {
                 $this->confirmDestructiveFix($lines);

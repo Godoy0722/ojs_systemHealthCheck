@@ -55,7 +55,7 @@ final class Fixer
      */
     public function countFixSteps(array $findings): int
     {
-        $steps = 2;
+        $steps = $this->hasEntityOrphanFindings($findings) ? 2 : 0;
 
         [$journalFindings, $rest] = $this->partitionFindings($findings);
 
@@ -129,9 +129,11 @@ final class Fixer
         ];
 
         $entityCleaner = new OrphanReferenceCleaner($this->gateway);
-        $result['entityReferencesRecovered'] = $entityCleaner->recoverReferences(function (string $table): void {
-            $this->reportStep($table, self::SCENARIO_RECOVER);
-        });
+        if ($this->hasEntityOrphanFindings($findings)) {
+            $result['entityReferencesRecovered'] = $entityCleaner->recoverReferences(function (string $table): void {
+                $this->reportStep($table, self::SCENARIO_RECOVER);
+            });
+        }
 
         [$journalFindings, $rest] = $this->partitionFindings($findings);
 
@@ -403,6 +405,17 @@ final class Fixer
             }
         }
         return array_keys($journalIds);
+    }
+
+    /** @param Finding[] $findings */
+    private function hasEntityOrphanFindings(array $findings): bool
+    {
+        foreach ($findings as $f) {
+            if (Finding::isEntityOrphan($f)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private function isFixableFinding(Finding $finding): bool
