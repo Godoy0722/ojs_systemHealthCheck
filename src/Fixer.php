@@ -71,7 +71,7 @@ final class Fixer
         $fixedBulk = [];
         $fixedEntityRules = [];
         foreach ($rest as $finding) {
-            if (!$this->isFixableFinding($finding)) {
+            if (!self::isFixableFinding($finding)) {
                 continue;
             }
             if (Finding::isBulk($finding)) {
@@ -218,7 +218,7 @@ final class Fixer
 
                     case Finding::REASON_REVIEW_REVISION:
                         $this->reportStep('submission_files', self::SCENARIO_REVIEW);
-                        $deleted = $this->gateway->deleteReviewRevisionFile($finding->pk);
+                        $deleted = $this->gateway->deleteReviewRevisionFile((int) $finding->pk);
                         $deleted > 0 ? $result['reviewFilesDeleted'] += $deleted : $result['failed']++;
                         break;
 
@@ -418,7 +418,7 @@ final class Fixer
         return false;
     }
 
-    private function isFixableFinding(Finding $finding): bool
+    public static function isFixableFinding(Finding $finding): bool
     {
         switch ($finding->reason) {
             case Finding::REASON_ORPHAN_ENTITY:
@@ -437,43 +437,6 @@ final class Fixer
         if ($this->progress !== null) {
             $this->progress->step($table, $scenario);
         }
-    }
-
-    /** @return array<string, array<int|string>> */
-    private function resolveCascadeIds(array $forwardPlan, int $journalId): array
-    {
-        $idsByTable = [];
-        foreach ($forwardPlan as $step) {
-            if ($step['source'] === 'journal') {
-                if (!empty($step['aggregate'])) {
-                    $ids = [$journalId];
-                } else {
-                    $ids = $this->gateway->findRowIdsByColumn(
-                        $step['table'],
-                        $step['identity'],
-                        $step['column'],
-                        [$journalId],
-                        $step['assocType']
-                    );
-                }
-            } else {
-                $parentIds = $idsByTable[$step['parent']] ?? [];
-                if (empty($parentIds)) {
-                    continue;
-                }
-                $ids = $this->gateway->findRowIdsByColumn(
-                    $step['table'],
-                    $step['identity'],
-                    $step['column'],
-                    $parentIds,
-                    $step['assocType']
-                );
-            }
-            if (!empty($ids)) {
-                $idsByTable[$step['table']] = $ids;
-            }
-        }
-        return $idsByTable;
     }
 
     private function settingRowAlreadyGone(Finding $finding): bool

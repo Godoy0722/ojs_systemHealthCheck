@@ -73,15 +73,20 @@ final class EntityReferenceRegistry
             new EntityReferenceRule('review_form_elements', 'review_form_id', 'review_forms', 'review_form_id', $req, $s),
             new EntityReferenceRule('announcements', 'type_id', 'announcement_types', 'type_id', $nil, $s),
             new EntityReferenceRule('citations', 'publication_id', 'publications', 'publication_id', $req, $pub),
-            new EntityReferenceRule('event_log', 'user_id', 'users', 'user_id', $del, $s),
+            // event_log.user_id is NOT NULL history of a live object (OJS leaves it
+            // dangling after account removal). Leftovers whose assoc parent is gone
+            // are handled by AssocLeftoverRegistry, not by deleting on user_id.
             new EntityReferenceRule('library_files', 'submission_id', 'submissions', 'submission_id', $del, $ctx, true),
-            new EntityReferenceRule('notifications', 'user_id', 'users', 'user_id', $del, $s, true),
+            // Inbox row of a missing user: NULLIFY when the object still exists.
+            // Leftover notifications whose assoc parent is gone: AssocLeftoverRegistry.
+            new EntityReferenceRule('notifications', 'user_id', 'users', 'user_id', $nil, $s, true),
             new EntityReferenceRule('submission_search_objects', 'submission_id', 'submissions', 'submission_id', $req, $sub),
             new EntityReferenceRule('access_keys', 'user_id', 'users', 'user_id', $req, $s),
             new EntityReferenceRule('edit_decisions', 'submission_id', 'submissions', 'submission_id', $req, $sub),
             new EntityReferenceRule('edit_decisions', 'editor_id', 'users', 'user_id', $req, $sub),
             new EntityReferenceRule('edit_decisions', 'review_round_id', 'review_rounds', 'review_round_id', $del, $sub, true),
-            new EntityReferenceRule('email_log_users', 'user_id', 'users', 'user_id', $req, $s),
+            // Recipient of a still-existing email_log row is history; do not DELETE
+            // on user_id. Junction rows whose email_log parent is gone are leftovers.
             new EntityReferenceRule('email_log_users', 'email_log_id', 'email_log', 'log_id', $req, $s),
             new EntityReferenceRule('data_object_tombstone_oai_set_objects', 'tombstone_id', 'data_object_tombstones', 'tombstone_id', $req, $tomb),
             new EntityReferenceRule('data_object_tombstone_settings', 'tombstone_id', 'data_object_tombstones', 'tombstone_id', $req, $tomb),
@@ -122,7 +127,9 @@ final class EntityReferenceRegistry
             new EntityReferenceRule('issue_files', 'issue_id', 'issues', 'issue_id', $req, $iss),
             new EntityReferenceRule('subscriptions', 'user_id', 'users', 'user_id', $req, $subsc),
             new EntityReferenceRule('subscriptions', 'type_id', 'subscription_types', 'type_id', $req, $subsc),
-            new EntityReferenceRule('completed_payments', 'user_id', 'users', 'user_id', $del, $s),
+            // Payment history of a live journal: NULLIFY the missing payer.
+            // Dead-journal rows stay for --deleted-journal (context_id root).
+            new EntityReferenceRule('completed_payments', 'user_id', 'users', 'user_id', $nil, $ctx),
             new EntityReferenceRule('custom_issue_orders', 'issue_id', 'issues', 'issue_id', $req, $iss),
             new EntityReferenceRule('custom_section_orders', 'section_id', 'sections', 'section_id', $req, $sec),
             new EntityReferenceRule('custom_section_orders', 'issue_id', 'issues', 'issue_id', $req, $iss),

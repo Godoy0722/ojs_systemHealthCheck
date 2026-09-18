@@ -361,18 +361,6 @@ final class IlluminateDatabaseGateway
     }
 
     /**
-     * First resolvable FK for a settings table (backward-compatible helper).
-     *
-     * @param string $settingsTable Settings table name
-     * @return array{column:string,parentTable:string,parentColumn:string,ignoreZero?:bool}|null
-     */
-    public function getForeignKey(string $settingsTable): ?array
-    {
-        $keys = $this->getForeignKeys($settingsTable);
-        return empty($keys) ? null : $keys[0];
-    }
-
-    /**
      * Yields rows from a settings table whose FK value has no matching row
      * in the parent table (Pass C — orphan detection).
      *
@@ -1029,11 +1017,6 @@ final class IlluminateDatabaseGateway
         return $identities;
     }
 
-    public function getTableForeignKey(string $table): ?string
-    {
-        return $this->getTableMeta($table)['fk'];
-    }
-
     /**
      * Yields identity values for rows belonging to dead journals on a nested cascade step.
      *
@@ -1270,7 +1253,7 @@ final class IlluminateDatabaseGateway
             return 0;
         }
         foreach ($ids as $id) {
-            $deleted += $this->deleteReviewRevisionFile($id);
+            $deleted += $this->deleteReviewRevisionFile((int) $id);
         }
         return $deleted;
     }
@@ -1278,68 +1261,73 @@ final class IlluminateDatabaseGateway
     /**
      * Cascade-deletes a submission_file row stuck in REVIEW_REVISION status
      * along with its revisions, settings, review-round associations, review
-     * files, and notes. Attempts physical file deletion via the OJS file
-     * service but falls back to DB-only cleanup when that fails.
+     * files, and notes. SQL runs in one transaction (same primitive as the
+     * journal cascade). Exclusive blobs are removed from disk only after
+     * commit, so a SQL failure cannot leave a half-deleted file.
      *
-     * @param int $submissionFileId
      * @return int Number of submission_files rows deleted (0 or 1)
      */
-    public function deleteReviewRevisionFile($submissionFileId): int
+    public function deleteReviewRevisionFile(int $submissionFileId): int
     {
         if (!$this->tableExists('submission_files')) {
             return 0;
         }
 
-        $revisions = Capsule::table('submission_file_revisions')
-            ->where('submission_file_id', $submissionFileId)
-            ->get(['file_id']);
+        $blobIds = [];
+        $deleted = $this->runInTransaction(function () use ($submissionFileId, &$blobIds) {
+            $revisions = Capsule::table('submission_file_revisions')
+                ->where('submission_file_id', $submissionFileId)
+                ->get(['file_id']);
 
-        foreach ($revisions as $revision) {
-            $fileId = $revision->file_id;
-            $otherRefs = Capsule::table('submission_file_revisions')
-                ->where('file_id', $fileId)
-                ->where('submission_file_id', '!=', $submissionFileId)
-                ->count();
-            if ($otherRefs === 0) {
-                try {
-                    \Services::get('file')->delete($fileId);
-                } catch (\Throwable $e) {
-                    // Even if file deletion fails, remove revision link to avoid blocking DB cleanup
-                    Capsule::table('submission_file_revisions')
-                        ->where('submission_file_id', $submissionFileId)
-                        ->where('file_id', $fileId)
-                        ->delete();
-                }
-            } else {
-                Capsule::table('submission_file_revisions')
-                    ->where('submission_file_id', $submissionFileId)
+            foreach ($revisions as $revision) {
+                $fileId = (int) $revision->file_id;
+                $otherRefs = Capsule::table('submission_file_revisions')
                     ->where('file_id', $fileId)
+                    ->where('submission_file_id', '!=', $submissionFileId)
+                    ->count();
+                if ($otherRefs === 0) {
+                    $blobIds[$fileId] = $fileId;
+                }
+            }
+
+            Capsule::table('submission_file_revisions')
+                ->where('submission_file_id', $submissionFileId)
+                ->delete();
+
+            Capsule::table('submission_file_settings')
+                ->where('submission_file_id', $submissionFileId)
+                ->delete();
+
+            Capsule::table('review_round_files')
+                ->where('submission_file_id', $submissionFileId)
+                ->delete();
+
+            Capsule::table('review_files')
+                ->where('submission_file_id', $submissionFileId)
+                ->delete();
+
+            if (defined('ASSOC_TYPE_SUBMISSION_FILE')) {
+                Capsule::table('notes')
+                    ->where('assoc_type', ASSOC_TYPE_SUBMISSION_FILE)
+                    ->where('assoc_id', $submissionFileId)
                     ->delete();
+            }
+
+            return (int) Capsule::table('submission_files')
+                ->where('submission_file_id', $submissionFileId)
+                ->delete();
+        });
+
+        foreach ($blobIds as $fileId) {
+            try {
+                \Services::get('file')->delete($fileId);
+            } catch (\Throwable $e) {
+                // DB already committed. A leftover blob is an unreferenced
+                // files row the --orphan pass can remove.
             }
         }
 
-        Capsule::table('submission_file_settings')
-            ->where('submission_file_id', $submissionFileId)
-            ->delete();
-
-        Capsule::table('review_round_files')
-            ->where('submission_file_id', $submissionFileId)
-            ->delete();
-
-        Capsule::table('review_files')
-            ->where('submission_file_id', $submissionFileId)
-            ->delete();
-
-        if (defined('ASSOC_TYPE_SUBMISSION_FILE')) {
-            Capsule::table('notes')
-                ->where('assoc_type', ASSOC_TYPE_SUBMISSION_FILE)
-                ->where('assoc_id', $submissionFileId)
-                ->delete();
-        }
-
-        return (int) Capsule::table('submission_files')
-            ->where('submission_file_id', $submissionFileId)
-            ->delete();
+        return $deleted;
     }
 
     /**
@@ -1635,152 +1623,6 @@ final class IlluminateDatabaseGateway
         return $deleted;
     }
 
-    public function registerJournalCascadeScope(array &$scopeByTable, string $table, array $step, int $journalId): void
-    {
-        $this->registerJournalCascadeScopeForDeadJournals($scopeByTable, $table, $step, [$journalId]);
-    }
-
-    /**
-     * @param array<int> $deadJournalIds
-     * @param array<string, callable(): \Illuminate\Database\Query\Builder> $scopeByTable
-     */
-    public function registerJournalCascadeScopeForDeadJournals(
-        array &$scopeByTable,
-        string $table,
-        array $step,
-        array $deadJournalIds
-    ): void {
-        if (empty($deadJournalIds)) {
-            return;
-        }
-        $identity = $step['identity'];
-        $column = $step['column'];
-        $assocType = $step['assocType'];
-        $scopeByTable[$table] = function () use ($table, $identity, $column, $deadJournalIds, $assocType) {
-            $q = Capsule::table($table)->select($identity)->whereIn($column, $deadJournalIds);
-            if ($assocType !== null) {
-                $q->where('assoc_type', $assocType);
-            }
-            return $q;
-        };
-    }
-
-    /**
-     * @param array<string, callable(): \Illuminate\Database\Query\Builder> $scopeByTable
-     */
-    public function countRowsByCascadeScope(string $table, array $step, array &$scopeByTable): int
-    {
-        $parent = $step['parent'];
-        if ($parent === null || !isset($scopeByTable[$parent]) || !$this->tableExists($table)) {
-            return 0;
-        }
-        try {
-            $query = Capsule::table($table)->whereIn($step['column'], $scopeByTable[$parent]());
-            if ($step['assocType'] !== null) {
-                $query->where('assoc_type', $step['assocType']);
-            }
-            $count = (int) $query->count();
-        } catch (\Throwable $e) {
-            return 0;
-        }
-        if ($count > 0 && $this->columnExists($table, $step['identity'])) {
-            $identity = $step['identity'];
-            $column = $step['column'];
-            $assocType = $step['assocType'];
-            $scopeByTable[$table] = function () use ($table, $identity, $column, &$scopeByTable, $parent, $assocType) {
-                $q = Capsule::table($table)->select($identity)->whereIn($column, $scopeByTable[$parent]());
-                if ($assocType !== null) {
-                    $q->where('assoc_type', $assocType);
-                }
-                return $q;
-            };
-        }
-        return $count;
-    }
-
-    /**
-     * Counts rows for one journal-cascade step using nested subqueries so
-     * Pass F never loads millions of parent ids into PHP.
-     *
-     * @param array<string, callable(): \Illuminate\Database\Query\Builder> $scopeByTable
-     * @deprecated Use registerJournalCascadeScope + countRowsByCascadeScope from Scanner
-     */
-    public function countRowsForJournalCascadeStep(array $step, int $journalId, array &$scopeByTable): int
-    {
-        $table = $step['table'];
-        if (!$this->tableExists($table) || !$this->columnExists($table, $step['column'])) {
-            return 0;
-        }
-
-        if ($step['source'] === 'journal') {
-            if (!empty($step['aggregate'])) {
-                return $this->countRowsByColumn(
-                    $table,
-                    $step['column'],
-                    [$journalId],
-                    $step['assocType']
-                );
-            }
-            if (!$this->columnExists($table, $step['identity'])) {
-                return 0;
-            }
-            try {
-                $query = Capsule::table($table)->where($step['column'], $journalId);
-                if ($step['assocType'] !== null) {
-                    $query->where('assoc_type', $step['assocType']);
-                }
-                $count = (int) $query->count();
-            } catch (\Throwable $e) {
-                return 0;
-            }
-            if ($count === 0) {
-                return 0;
-            }
-            $identity = $step['identity'];
-            $column = $step['column'];
-            $assocType = $step['assocType'];
-            $scopeByTable[$table] = function () use ($table, $identity, $column, $journalId, $assocType) {
-                $q = Capsule::table($table)->select($identity)->where($column, $journalId);
-                if ($assocType !== null) {
-                    $q->where('assoc_type', $assocType);
-                }
-                return $q;
-            };
-            return $count;
-        }
-
-        $parent = $step['parent'];
-        if ($parent === null || !isset($scopeByTable[$parent]) || !$this->columnExists($table, $step['identity'])) {
-            return 0;
-        }
-
-        try {
-            $parentSub = $scopeByTable[$parent]();
-            $query = Capsule::table($table)->whereIn($step['column'], $parentSub);
-            if ($step['assocType'] !== null) {
-                $query->where('assoc_type', $step['assocType']);
-            }
-            $count = (int) $query->count();
-        } catch (\Throwable $e) {
-            return 0;
-        }
-        if ($count === 0) {
-            return 0;
-        }
-
-        $identity = $step['identity'];
-        $column = $step['column'];
-        $assocType = $step['assocType'];
-        $scopeByTable[$table] = function () use ($table, $identity, $column, &$scopeByTable, $parent, $assocType) {
-            $q = Capsule::table($table)->select($identity)->whereIn($column, $scopeByTable[$parent]());
-            if ($assocType !== null) {
-                $q->where('assoc_type', $assocType);
-            }
-            return $q;
-        };
-        return $count;
-    }
-
     /**
      * Deletes rows whose $column matches any of $values, in chunks.
      * WRITES to the database.
@@ -1803,45 +1645,6 @@ final class IlluminateDatabaseGateway
                 $query->where('assoc_type', $assocType);
             }
             $deleted += (int) $query->delete();
-        }
-        return $deleted;
-    }
-
-    /**
-     * Deletes rows that FK to submission_files.submission_file_id. Required when
-     * the DB has FK constraints and those tables are not removed via review_round_id.
-     *
-     * @param array<int, int|string> $submissionIds
-     */
-    public function deleteSubmissionFileDependents(array $submissionIds): int
-    {
-        if (empty($submissionIds) || !$this->tableExists('submission_files')) {
-            return 0;
-        }
-
-        $fileIds = [];
-        foreach (array_chunk(array_values($submissionIds), self::ID_CHUNK) as $chunk) {
-            try {
-                foreach (Capsule::table('submission_files')
-                    ->whereIn('submission_id', $chunk)
-                    ->pluck('submission_file_id') as $id) {
-                    if ($id !== null) {
-                        $fileIds[(string) $id] = $id;
-                    }
-                }
-            } catch (\Throwable $e) {
-                return 0;
-            }
-        }
-        if (empty($fileIds)) {
-            return 0;
-        }
-
-        $deleted = 0;
-        foreach (['review_round_files', 'review_files', 'publication_galleys'] as $table) {
-            if ($this->tableExists($table) && $this->columnExists($table, 'submission_file_id')) {
-                $deleted += $this->deleteRowsByColumn($table, 'submission_file_id', array_values($fileIds));
-            }
         }
         return $deleted;
     }

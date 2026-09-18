@@ -32,7 +32,7 @@ Add `-f` or `--fix` to apply remediations:
 
 | Finding type | Fix applied |
 |-------------|-------------|
-| Orphaned rows | Settings rows are **deleted** (FK orphans and invalid `issueId`). Invalid entity FK columns in live journals are **repointed first** (`current_publication_id`, `section_id`), then remaining orphans are **deleted or set to NULL**. Unreferenced blob files are **deleted from disk and the database** |
+| Orphaned rows | Settings rows are **deleted** (FK orphans and invalid `issueId`). Invalid entity FK columns in live journals are **repointed first** (`current_publication_id`, `section_id`), then remaining orphans are **deleted or set to NULL**. Audit history keeps the row when the object still exists (NULLIFY or leave the actor FK). Leftover rows whose `assoc_type`/`assoc_id` parent is gone are **deleted**. Unreferenced blob files are **deleted from disk and the database** |
 | Missing locales | Retags existing bad rows with the site's primary locale |
 | Empty fields | **Skipped** — no safe automatic fix; reported for manual review |
 | Review revision files | Files and all associated DB records are **deleted** after 3-stage confirmation |
@@ -195,15 +195,19 @@ $ php tools/settingsHealthCheck.php --all
 ```bash
 $ php tools/settingsHealthCheck.php --locale --fix
 
-  Database: ojs_production
+  ================================================================================
+  Scenario: Bad locale tags (11 row(s)).
+  Multilingual settings were stored with an empty locale tag, which PHP 8 cannot hydrate.
+  The fix UPDATES those rows to the site/journal primary locale. No rows are deleted.
+  ================================================================================
+
+  Stage 1/3: Are you aware that this operation will UPDATE rows in the database? (yes/no): yes
   ...
+  Stage 3/3: Confirm by typing 'UPDATE': UPDATE
 
   Fixes applied
   -------------
-  Orphaned rows deleted : 0
   Missing locales set   : 11
-  Review files deleted  : 0
-  Empty fields skipped  : 0
 ```
 
 ## Example: Review Fix with Confirmation

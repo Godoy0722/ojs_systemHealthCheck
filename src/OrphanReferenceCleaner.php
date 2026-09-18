@@ -94,6 +94,54 @@ final class OrphanReferenceCleaner
             $findings[] = $finding;
         }
 
+        foreach (AssocLeftoverRegistry::rules() as $rule) {
+            if ($onRule !== null) {
+                $onRule($rule->sourceTable);
+            }
+            if (!$this->validateAssocLeftoverRule($rule)) {
+                continue;
+            }
+            $identities = $this->collectAssocLeftoverIdentities($rule);
+            if (empty($identities)) {
+                continue;
+            }
+
+            $parentPkCols = $this->gateway->getPrimaryKeyColumns($rule->sourceTable);
+            $parentIds = [];
+            if (count($parentPkCols) === 1) {
+                foreach ($identities as $tuple) {
+                    $parentIds[] = $tuple[$parentPkCols[0]];
+                }
+            }
+
+            $depCount = 0;
+            $unique = Finding::claimIdentities($claimed, $rule->sourceTable, $identities);
+            foreach ($rule->dependents as $dependent) {
+                [$depTable, $depFk] = $dependent;
+                $depIdentities = $this->collectDependentIdentities($depTable, $depFk, $parentIds);
+                $depCount += count($depIdentities);
+                if (!empty($depIdentities)) {
+                    $unique += Finding::claimIdentities($claimed, $depTable, $depIdentities);
+                }
+            }
+
+            $finding = new Finding(
+                $rule->sourceTable,
+                $rule->ruleKey(),
+                null,
+                'assoc_id',
+                null,
+                $depCount > 0
+                    ? (count($identities) . ' leftover + ' . $depCount . ' dependents')
+                    : 'assoc_type/assoc_id parent',
+                Finding::REASON_ORPHAN_ENTITY,
+                EntityReferenceRule::ACTION_DELETE_OPTIONAL,
+                count($identities) + $depCount
+            );
+            $finding->uniqueRowCount = $unique;
+            $findings[] = $finding;
+        }
+
         return $findings;
     }
 
@@ -196,10 +244,14 @@ final class OrphanReferenceCleaner
             return 0;
         }
         $rule = EntityReferenceRegistry::findByKey((string) $finding->pk);
-        if ($rule === null || !$this->validateRule($rule)) {
+        if ($rule !== null && $this->validateRule($rule)) {
+            return $this->fixInvalidReferences($rule, $this->getLiveJournalIds());
+        }
+        $leftover = AssocLeftoverRegistry::findByKey((string) $finding->pk);
+        if ($leftover === null || !$this->validateAssocLeftoverRule($leftover)) {
             return 0;
         }
-        return $this->fixInvalidReferences($rule, $this->getLiveJournalIds());
+        return $this->fixAssocLeftover($leftover);
     }
 
     /**
@@ -213,23 +265,44 @@ final class OrphanReferenceCleaner
             return [$finding];
         }
         $rule = EntityReferenceRegistry::findByKey((string) $finding->pk);
-        if ($rule === null || !$this->validateRule($rule)) {
+        if ($rule !== null && $this->validateRule($rule)) {
+            return $this->expandFromQuery(
+                $this->buildInvalidReferenceQuery($rule, $this->getLiveJournalIds()),
+                $rule->sourceTable,
+                $rule->sourceColumn,
+                $rule->referenceTable . '.' . $rule->referenceColumn,
+                $rule->action,
+                $finding
+            );
+        }
+        $leftover = AssocLeftoverRegistry::findByKey((string) $finding->pk);
+        if ($leftover === null || !$this->validateAssocLeftoverRule($leftover)) {
             return [$finding];
         }
+        // Keep leftover aggregate: rowCount includes dependent tables the fix
+        // deletes (e.g. event_log_settings), which this query does not list.
+        return [$finding];
+    }
 
-        $meta = $this->gateway->getTableMetaPublic($rule->sourceTable);
-        $pkCol = $meta['pk'] ?? $rule->sourceColumn;
-        $select = ['s.' . $pkCol . ' as pk', 's.' . $rule->sourceColumn . ' as fk'];
-        if ($this->gateway->columnExists($rule->sourceTable, 'setting_name')) {
+    /**
+     * @param \Illuminate\Database\Query\Builder $query
+     * @return Finding[]
+     */
+    private function expandFromQuery($query, string $table, string $fkColumn, string $preview, string $action, Finding $finding): array
+    {
+        $meta = $this->gateway->getTableMetaPublic($table);
+        $pkCol = $meta['pk'] ?? $fkColumn;
+        $select = ['s.' . $pkCol . ' as pk', 's.' . $fkColumn . ' as fk'];
+        if ($this->gateway->columnExists($table, 'setting_name')) {
             $select[] = 's.setting_name';
         }
-        if ($this->gateway->columnExists($rule->sourceTable, 'locale')) {
+        if ($this->gateway->columnExists($table, 'locale')) {
             $select[] = 's.locale';
         }
 
         $expanded = [];
         try {
-            $cursor = $this->buildInvalidReferenceQuery($rule, $this->getLiveJournalIds())
+            $cursor = $query
                 ->select($select)
                 ->orderBy('s.' . $pkCol)
                 ->cursor();
@@ -239,14 +312,14 @@ final class OrphanReferenceCleaner
 
         foreach ($cursor as $row) {
             $expanded[] = new Finding(
-                $rule->sourceTable,
+                $table,
                 $row->pk,
                 $row->fk,
-                $rule->sourceColumn,
+                $fkColumn,
                 isset($row->locale) ? (string) $row->locale : null,
-                $rule->referenceTable . '.' . $rule->referenceColumn,
+                $preview,
                 Finding::REASON_ORPHAN_ENTITY,
-                $rule->action
+                $action
             );
         }
 
@@ -455,7 +528,11 @@ final class OrphanReferenceCleaner
             foreach ($chunk as $tuple) {
                 $q->orWhere(function ($q2) use ($tuple) {
                     foreach ($tuple as $col => $val) {
-                        $q2->where($col, $val);
+                        if ($val === null) {
+                            $q2->whereNull($col);
+                        } else {
+                            $q2->where($col, $val);
+                        }
                     }
                 });
             }
@@ -605,6 +682,177 @@ final class OrphanReferenceCleaner
                     ->whereIn('shc_sec.journal_id', $liveJournalIds);
                 break;
         }
+    }
+
+    private function validateAssocLeftoverRule(AssocLeftoverRule $rule): bool
+    {
+        return $this->gateway->tableExists($rule->sourceTable)
+            && $this->gateway->columnExists($rule->sourceTable, 'assoc_type')
+            && $this->gateway->columnExists($rule->sourceTable, 'assoc_id')
+            && $this->resolvedAssocParents($rule) !== [];
+    }
+
+    /**
+     * @return array<int, array{0:string,1:string}> assoc_type => [table, pk] still present in schema
+     */
+    private function resolvedAssocParents(AssocLeftoverRule $rule): array
+    {
+        $map = AssocLeftoverRegistry::parentMap();
+        $resolved = [];
+        foreach ($rule->assocTypes as $type) {
+            if (!isset($map[$type])) {
+                continue;
+            }
+            [$table, $column] = $map[$type];
+            if ($this->gateway->tableExists($table) && $this->gateway->columnExists($table, $column)) {
+                $resolved[$type] = [$table, $column];
+            }
+        }
+        return $resolved;
+    }
+
+    private function buildAssocLeftoverQuery(AssocLeftoverRule $rule)
+    {
+        $parents = $this->resolvedAssocParents($rule);
+        $query = Capsule::table($rule->sourceTable . ' as s')
+            ->whereNotNull('s.assoc_type')
+            ->whereNotNull('s.assoc_id')
+            ->where(function ($outer) use ($parents) {
+                $first = true;
+                foreach ($parents as $type => $parent) {
+                    [$table, $column] = $parent;
+                    $clause = function ($q) use ($type, $table, $column) {
+                        $q->where('s.assoc_type', '=', $type)
+                            ->whereNotExists(function ($n) use ($table, $column) {
+                                $n->from($table . ' as ap')
+                                    ->whereColumn('ap.' . $column, '=', 's.assoc_id')
+                                    ->selectRaw('1');
+                            });
+                    };
+                    if ($first) {
+                        $outer->where($clause);
+                        $first = false;
+                    } else {
+                        $outer->orWhere($clause);
+                    }
+                }
+            });
+        return $query;
+    }
+
+    /**
+     * @return array<int, array<string, mixed>>
+     */
+    private function collectAssocLeftoverIdentities(AssocLeftoverRule $rule): array
+    {
+        $pkCols = $this->gateway->getPrimaryKeyColumns($rule->sourceTable);
+        if (empty($pkCols)) {
+            $this->warnings[] = sprintf(
+                'Pass H cannot identify leftover rows for %s: table %s has no primary key',
+                $rule->ruleKey(),
+                $rule->sourceTable
+            );
+            return [];
+        }
+
+        $select = [];
+        foreach ($pkCols as $col) {
+            $select[] = 's.' . $col . ' as ' . $col;
+        }
+
+        try {
+            $rows = $this->buildAssocLeftoverQuery($rule)
+                ->select($select)
+                ->distinct()
+                ->get();
+        } catch (\Throwable $e) {
+            $this->warnings[] = sprintf('Pass H leftover identity query failed for %s: %s', $rule->ruleKey(), $e->getMessage());
+            return [];
+        }
+
+        $identities = [];
+        foreach ($rows as $row) {
+            $tuple = [];
+            foreach ($pkCols as $col) {
+                $tuple[$col] = is_object($row) ? ($row->{$col} ?? $row->{strtoupper($col)} ?? null) : null;
+            }
+            $identities[] = $tuple;
+        }
+        return $identities;
+    }
+
+    /**
+     * Rows in a leftover dependent table that --fix will delete with the parent.
+     *
+     * @param array<int, mixed> $parentIds
+     * @return array<int, array<string, mixed>>
+     */
+    private function collectDependentIdentities(string $depTable, string $depFk, array $parentIds): array
+    {
+        if ($parentIds === []
+            || !$this->gateway->tableExists($depTable)
+            || !$this->gateway->columnExists($depTable, $depFk)
+        ) {
+            return [];
+        }
+
+        $pkCols = $this->gateway->getPrimaryKeyColumns($depTable);
+        if (empty($pkCols)) {
+            $pkCols = [$depFk];
+        }
+
+        $select = [];
+        foreach ($pkCols as $col) {
+            $select[] = $col;
+        }
+
+        $identities = [];
+        foreach (array_chunk(array_values($parentIds), self::ID_CHUNK) as $chunk) {
+            try {
+                $rows = Capsule::table($depTable)->select($select)->whereIn($depFk, $chunk)->get();
+            } catch (\Throwable $e) {
+                $this->warnings[] = sprintf(
+                    'Pass H leftover dependents failed for %s.%s: %s',
+                    $depTable,
+                    $depFk,
+                    $e->getMessage()
+                );
+                return $identities;
+            }
+            foreach ($rows as $row) {
+                $tuple = [];
+                foreach ($pkCols as $col) {
+                    $tuple[$col] = is_object($row) ? ($row->{$col} ?? $row->{strtoupper($col)} ?? null) : null;
+                }
+                $identities[] = $tuple;
+            }
+        }
+        return $identities;
+    }
+
+    private function fixAssocLeftover(AssocLeftoverRule $rule): int
+    {
+        $identities = $this->collectAssocLeftoverIdentities($rule);
+        if (empty($identities)) {
+            return 0;
+        }
+
+        $deleted = 0;
+        $pkCols = $this->gateway->getPrimaryKeyColumns($rule->sourceTable);
+        if (count($pkCols) === 1) {
+            $ids = [];
+            foreach ($identities as $tuple) {
+                $ids[] = $tuple[$pkCols[0]];
+            }
+            foreach ($rule->dependents as $dependent) {
+                [$depTable, $depFk] = $dependent;
+                if ($this->gateway->tableExists($depTable) && $this->gateway->columnExists($depTable, $depFk)) {
+                    $deleted += $this->gateway->deleteRowsByColumn($depTable, $depFk, $ids);
+                }
+            }
+        }
+
+        return $deleted + $this->deleteRowsByIdentity($rule->sourceTable, $identities);
     }
 
     private function validateRule(EntityReferenceRule $rule): bool

@@ -85,18 +85,25 @@ Full rule list: every entry in `EntityReferenceRegistry::rules()`.
 
 Fix order on `--fix`: repoint `current_publication_id` and `section_id` first, then delete rows or set invalid FK columns to NULL per rule action.
 
+History vs leftover on audit-style tables is split:
+
+- **History** (object still exists, actor user is gone) — do not DELETE on `user_id` / `sender_id`. `completed_payments.user_id` and `notifications.user_id` are nullable, so those are **set to NULL**. `event_log.user_id`, `email_log.sender_id`, `notes.user_id`, and `email_log_users.user_id` are left dangling, matching `UserDAO::deleteUserById`.
+- **Leftover** (assoc parent is gone) — `event_log`, `email_log`, `notes`, `item_views`, and `notifications` rows whose known `assoc_type`/`assoc_id` parent no longer exists are **deleted** (`AssocLeftoverRegistry`), **including dependent rows** the fix removes in the same step (`event_log_settings`, `email_log_users`, `notification_settings`). Those dependents are included in the leftover finding's unique count so the scenario total matches `--fix` deletes. Unknown `assoc_type` values are kept. Nullable actor FKs (`completed_payments.user_id`, `notifications.user_id`) are **SET NULL** and are not part of the delete total.
+
 ---
 
 ## Additional checks within `--orphan`
 
 - **Publication issue link** — `publication_settings` rows where `setting_name = issueId` and the stored issue no longer exists
 - **Unreferenced blob files** — rows in `files` not referenced by `submission_files.file_id` or `submission_file_revisions.file_id`
+- **Assoc leftovers** — polymorphic `assoc_type`/`assoc_id` rows whose mapped parent object is gone (see above)
 
 ---
 
 ## Explicitly excluded
 
 - **Site settings** (`site_settings`) — global key/value store with no parent entity FK
+- **Actor FKs on live objects** — `email_log.sender_id`, `notes.user_id`, `item_views.user_id`, `event_log.user_id`, `email_log_users.user_id` are not deleted when the associated object still exists
 
 ---
 

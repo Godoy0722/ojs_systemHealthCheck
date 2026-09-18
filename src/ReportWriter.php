@@ -77,7 +77,11 @@ final class ReportWriter
      */
     public function computeStats(array $findings): int
     {
-        return $this->sumRowCounts($findings);
+        $total = 0;
+        foreach ($findings as $finding) {
+            $total += Finding::statCount($finding);
+        }
+        return $total;
     }
 
     /**
@@ -175,7 +179,7 @@ final class ReportWriter
             }
             $buckets[$scenario]['findings'][] = $f;
             $table = $f->table;
-            $buckets[$scenario]['tables'][$table] = ($buckets[$scenario]['tables'][$table] ?? 0) + Finding::statCount($f);
+            $buckets[$scenario]['tables'][$table] = ($buckets[$scenario]['tables'][$table] ?? 0) + Finding::deleteCount($f);
         }
         return $buckets;
     }
@@ -189,7 +193,7 @@ final class ReportWriter
     {
         $total = 0;
         foreach ($findings as $finding) {
-            $total += Finding::statCount($finding);
+            $total += Finding::deleteCount($finding);
         }
         return $total;
     }
@@ -574,6 +578,11 @@ final class ReportWriter
                     $action = $f->suggestedLocale === EntityReferenceRule::ACTION_NULLIFY
                         ? 'The invalid value should be set to NULL.'
                         : 'The row(s) should be deleted.';
+                    if (strpos((string) $f->pk, 'assoc_id->assoc_parent') !== false) {
+                        return 'This assoc_type/assoc_id parent is gone. The leftover row(s) and any '
+                            . 'registered dependents (log settings, email_log_users, notification_settings) '
+                            . 'will be deleted. Count: ' . $f->valuePreview . '.';
+                    }
                     return 'Column "' . $f->settingName . '" references missing row(s) in '
                         . $f->valuePreview . '. ' . $action;
                 }

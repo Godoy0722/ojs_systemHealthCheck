@@ -87,6 +87,15 @@ final class Finding
         return $f->uniqueRowCount;
     }
 
+    /** Rows this finding's --fix will DELETE (not NULLIFY). */
+    public static function deleteCount(self $f): int
+    {
+        if ($f->suggestedLocale === EntityReferenceRule::ACTION_NULLIFY) {
+            return 0;
+        }
+        return $f->uniqueRowCount;
+    }
+
     /**
      * Marks previously unseen primary-key tuples for $table and returns how
      * many of $identities are new. Two FK rules on the same physical row

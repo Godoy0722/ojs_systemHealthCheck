@@ -49,9 +49,6 @@ final class Scanner
     /** @var JournalCascadeRegistry|null */
     private $cascadeRegistry = null;
 
-    /** @var array<int, array{journalId:int, tables:array<string,int>, rows:int}> */
-    private array $deadJournalResults = [];
-
     /** @var string[] */
     private array $unmappedTables = [];
 
@@ -328,7 +325,9 @@ final class Scanner
             $total += count($this->schemaMap) + count($this->unmappedTables);
         }
         if (!empty($run[self::CHECK_ORPHAN])) {
-            $total += count($this->tableResults) + 1 + count(EntityReferenceRegistry::rules());
+            $total += count($this->tableResults) + 1
+                + count(EntityReferenceRegistry::rules())
+                + count(AssocLeftoverRegistry::rules());
         }
         if (!empty($run[self::CHECK_EMPTY])) {
             $total += count($this->entityMap);
@@ -811,25 +810,6 @@ final class Scanner
                 $count
             );
         }
-
-        foreach ($deadIds as $journalId) {
-            $this->deadJournalResults[$journalId] = [
-                'journalId' => $journalId,
-                'tables' => $tableCounts,
-                'rows' => array_sum($tableCounts),
-            ];
-        }
-    }
-
-    /**
-     * Per-journal results from Pass F: how many leftover rows each dead
-     * journal owns, and in which tables.
-     *
-     * @return array<int, array{journalId:int, tables:array<string,int>, rows:int}>
-     */
-    public function getDeadJournalResults(): array
-    {
-        return $this->deadJournalResults;
     }
 
     /**

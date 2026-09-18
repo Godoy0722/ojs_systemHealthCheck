@@ -28,11 +28,13 @@ require_once(dirname(__FILE__) . '/src/Scanner.php');
 require_once(dirname(__FILE__) . '/src/ReportWriter.php');
 require_once(dirname(__FILE__) . '/src/EntityReferenceRule.php');
 require_once(dirname(__FILE__) . '/src/EntityReferenceRegistry.php');
+require_once(dirname(__FILE__) . '/src/AssocLeftoverRegistry.php');
 require_once(dirname(__FILE__) . '/src/OrphanReferenceCleaner.php');
 require_once(dirname(__FILE__) . '/src/FindingExpander.php');
 require_once(dirname(__FILE__) . '/src/ProgressReporter.php');
 require_once(dirname(__FILE__) . '/src/Fixer.php');
 
+use APP\tools\settingsHealthCheck\src\EntityReferenceRule;
 use APP\tools\settingsHealthCheck\src\Finding;
 use APP\tools\settingsHealthCheck\src\FindingExpander;
 use APP\tools\settingsHealthCheck\src\Fixer;
@@ -278,25 +280,44 @@ class SettingsHealthCheckTool extends CommandLineTool
     /** @param Finding[] $findings */
     private function confirmDestructiveFixes(array $findings, IlluminateDatabaseGateway $gateway): void
     {
-        $counts = ['review' => 0, 'journalRows' => 0, 'journalIds' => [], 'journalIdCount' => 0, 'orphanFiles' => 0, 'entityOrphans' => 0];
+        $locale = 0;
+        $settingsOrphans = 0;
+        $orphanFiles = 0;
+        $entityDeletes = 0;
+        $entityNullify = 0;
+        $review = 0;
+        $journalRows = 0;
+        $journalIds = [];
+        $journalIdCount = 0;
+
         foreach ($findings as $f) {
             switch ($f->reason) {
+                case Finding::REASON_SCHEMA_MISSING_LOCALE:
+                case Finding::REASON_HEURISTIC_LOCALE_MISMATCH:
+                    $locale += Finding::statCount($f);
+                    break;
                 case Finding::REASON_REVIEW_REVISION:
-                    $counts['review'] += Finding::statCount($f);
+                    $review += Finding::statCount($f);
                     break;
                 case Finding::REASON_DELETED_JOURNAL:
-                    $counts['journalRows'] += Finding::statCount($f);
+                    $journalRows += Finding::statCount($f);
                     if ($f->entityId !== null) {
-                        $counts['journalIds'][(int) $f->entityId] = true;
+                        $journalIds[(int) $f->entityId] = true;
                     } elseif (preg_match('/^(\d+) dead journal/', $f->valuePreview, $m)) {
-                        $counts['journalIdCount'] = max($counts['journalIdCount'], (int) $m[1]);
+                        $journalIdCount = max($journalIdCount, (int) $m[1]);
                     }
                     break;
                 case Finding::REASON_ORPHAN_ENTITY:
                     if ($f->table === 'files') {
-                        $counts['orphanFiles'] += Finding::statCount($f);
+                        $orphanFiles += Finding::deleteCount($f);
                     } elseif (Finding::isEntityOrphan($f)) {
-                        $counts['entityOrphans'] += Finding::statCount($f);
+                        if ($f->suggestedLocale === EntityReferenceRule::ACTION_NULLIFY) {
+                            $entityNullify += Finding::statCount($f);
+                        } else {
+                            $entityDeletes += Finding::deleteCount($f);
+                        }
+                    } else {
+                        $settingsOrphans += Finding::deleteCount($f);
                     }
                     break;
             }
@@ -304,39 +325,71 @@ class SettingsHealthCheckTool extends CommandLineTool
 
         $recoverPub = 0;
         $recoverSec = 0;
-        if ($counts['entityOrphans'] > 0) {
+        if ($entityDeletes + $entityNullify > 0) {
             $recover = (new OrphanReferenceCleaner($gateway))->countRecoverableReferences();
             $recoverPub = $recover['currentPublication'];
             $recoverSec = $recover['section'];
         }
-        $entityLines = [
-            "WARNING: {$counts['entityOrphans']} entity row(s) with invalid references in live journals.",
-        ];
-        if ($recoverPub + $recoverSec > 0) {
-            $entityLines[] = "Fixing will first repoint {$recoverPub} current_publication_id value(s) and {$recoverSec} section_id value(s),";
-            $entityLines[] = 'then DELETE or SET NULL the remaining invalid references.';
-        } else {
-            $entityLines[] = 'Rows will be DELETED or SET NULL. No current_publication_id/section_id repointing is needed.';
+
+        $orphanLines = ['Scenario: Orphaned settings, entities & files.'];
+        if ($settingsOrphans > 0) {
+            $orphanLines[] = $settingsOrphans . ' settings row(s) whose parent entity is gone will be DELETED (including invalid publication issueId values).';
+        }
+        if ($orphanFiles > 0) {
+            $orphanLines[] = $orphanFiles . ' unreferenced blob(s) will be deleted from disk and from the files table.';
+        }
+        if ($entityDeletes > 0) {
+            $orphanLines[] = $entityDeletes . ' live-journal row(s) with invalid foreign keys will be DELETED (assoc leftovers include dependent rows).';
+            if ($recoverPub + $recoverSec > 0) {
+                $orphanLines[] = "First, {$recoverPub} current_publication_id and {$recoverSec} section_id value(s) will be repointed.";
+            } else {
+                $orphanLines[] = 'No current_publication_id/section_id repointing is needed.';
+            }
         }
 
-        foreach ([
-            [$counts['review'], [
-                "WARNING: {$counts['review']} file(s) under REVIEW_REVISION.",
-                'Fixing will permanently delete these files and their database records.',
-            ]],
-            [$counts['journalRows'], [
-                'WARNING: ' . $counts['journalRows'] . ' row(s) belonging to '
-                    . (count($counts['journalIds']) ?: $counts['journalIdCount']) . ' deleted journal(s).',
-                'Fixing will permanently delete every one of those rows.',
-            ]],
-            [$counts['orphanFiles'], [
-                "WARNING: {$counts['orphanFiles']} unreferenced blob file(s) in the files table.",
-                'Fixing will delete those files from disk and the database.',
-            ]],
-            [$counts['entityOrphans'], $entityLines],
-        ] as [$n, $lines]) {
+        $nullifyLines = [
+            'Scenario: Invalid entity references SET NULL (' . $entityNullify . ' row(s)).',
+            'These foreign keys point at missing rows; the column is nullable.',
+            'The fix UPDATES those columns to NULL. No rows are deleted.',
+        ];
+
+        $journalCount = count($journalIds) ?: $journalIdCount;
+        $prompts = [
+            [
+                $locale,
+                'UPDATE',
+                [
+                    'Scenario: Bad locale tags (' . $locale . ' row(s)).',
+                    'Multilingual settings were stored with an empty locale tag, which PHP 8 cannot hydrate.',
+                    'The fix UPDATES those rows to the site/journal primary locale. No rows are deleted.',
+                ],
+            ],
+            [$entityNullify, 'UPDATE', $nullifyLines],
+            [$settingsOrphans + $orphanFiles + $entityDeletes, 'DELETE', $orphanLines],
+            [
+                $review,
+                'DELETE',
+                [
+                    'Scenario: REVIEW_REVISION files (' . $review . ' file(s)).',
+                    'Submission files in file_stage REVIEW_REVISION (15) are flagged as blocking CLI deletion.',
+                    'The fix DELETES those files plus their revisions, settings, review-round links, and notes.',
+                ],
+            ],
+            [
+                $journalRows,
+                'DELETE',
+                [
+                    'Scenario: Deleted journal leftovers (' . $journalRows . ' row(s) across '
+                        . $journalCount . ' journal(s)).',
+                    'These rows still belong to journals that no longer exist in the journals table.',
+                    'The fix DELETES that leftover tree (issues, submissions, settings, files, etc.). Live journals are not touched.',
+                ],
+            ],
+        ];
+
+        foreach ($prompts as [$n, $confirmWord, $lines]) {
             if ($n > 0) {
-                $this->confirmDestructiveFix($lines);
+                $this->confirmDestructiveFix($lines, $confirmWord);
             }
         }
     }
@@ -346,25 +399,11 @@ class SettingsHealthCheckTool extends CommandLineTool
     {
         $total = 0;
         foreach ($findings as $f) {
-            if ($this->isFixableFinding($f)) {
+            if (Fixer::isFixableFinding($f)) {
                 $total += Finding::statCount($f);
             }
         }
         return $total;
-    }
-
-    private function isFixableFinding(Finding $f): bool
-    {
-        switch ($f->reason) {
-            case Finding::REASON_ORPHAN_ENTITY:
-            case Finding::REASON_SCHEMA_MISSING_LOCALE:
-            case Finding::REASON_HEURISTIC_LOCALE_MISMATCH:
-            case Finding::REASON_REVIEW_REVISION:
-            case Finding::REASON_DELETED_JOURNAL:
-                return true;
-            default:
-                return false;
-        }
     }
 
     /** @param array{orphansDeleted:int, orphanFilesDeleted:int, entityReferencesRecovered:int, entityOrphansFixed:int, localesFixed:int, reviewFilesDeleted:int, journalRecordsDeleted:int, alreadyRemoved:int, skipped:int, failed:int} $result */
@@ -392,7 +431,7 @@ class SettingsHealthCheckTool extends CommandLineTool
     {
         $total = 0;
         foreach ($findings as $f) {
-            if (!$this->isFixableFinding($f)) {
+            if (!Fixer::isFixableFinding($f)) {
                 $total += Finding::statCount($f);
             }
         }
@@ -446,7 +485,7 @@ class SettingsHealthCheckTool extends CommandLineTool
     }
 
     /** @param string[] $warningLines */
-    private function confirmDestructiveFix(array $warningLines): void
+    private function confirmDestructiveFix(array $warningLines, string $confirmWord = 'DELETE'): void
     {
         if (!(function_exists('stream_isatty') && stream_isatty(STDIN))) {
             fwrite(STDERR, ReportWriter::color("[ERROR]", 'bold|red') . " Refusing --fix with piped input. Run interactively with a real terminal.\n");
@@ -460,20 +499,27 @@ class SettingsHealthCheckTool extends CommandLineTool
         }
         echo ReportWriter::color("================================================================================\n\n", 'bold|red');
 
-        echo "Stage 1/3: Are you aware that this operation will delete data in the database? (yes/no): ";
-        if (strtolower(trim(fgets(STDIN))) !== 'yes') {
-            echo ReportWriter::color("Aborted: User did not confirm awareness of database deletion.\n", 'yellow');
+        $deletes = $confirmWord === 'DELETE';
+        $stage1 = $deletes
+            ? 'Stage 1/3: Are you aware that this operation will delete data in the database? (yes/no): '
+            : 'Stage 1/3: Are you aware that this operation will UPDATE rows in the database? (yes/no): ';
+        echo $stage1;
+        if (strtolower(trim((string) fgets(STDIN))) !== 'yes') {
+            echo ReportWriter::color("Aborted: User did not confirm awareness of the database change.\n", 'yellow');
             exit(1);
         }
 
-        echo "Stage 2/3: Do you really want to execute this operation in the database? This is your second confirmation. (yes/no): ";
-        if (strtolower(trim(fgets(STDIN))) !== 'yes') {
+        echo 'Stage 2/3: Do you really want to execute this operation in the database? This is your second confirmation. (yes/no): ';
+        if (strtolower(trim((string) fgets(STDIN))) !== 'yes') {
             echo ReportWriter::color("Aborted: User did not provide the second confirmation.\n", 'yellow');
             exit(1);
         }
 
-        echo "Stage 3/3: This is the final confirmation. This will permanently delete files and database records. Confirm by typing 'DELETE': ";
-        if (trim(fgets(STDIN)) !== 'DELETE') {
+        $stage3 = $deletes
+            ? "Stage 3/3: This is the final confirmation. This will permanently delete files and database records. Confirm by typing 'DELETE': "
+            : "Stage 3/3: This is the final confirmation. This will permanently UPDATE locale tags. Confirm by typing 'UPDATE': ";
+        echo $stage3;
+        if (trim((string) fgets(STDIN)) !== $confirmWord) {
             echo ReportWriter::color("Aborted: Final confirmation mismatch.\n", 'yellow');
             exit(1);
         }
