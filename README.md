@@ -118,10 +118,10 @@ Pick a number to see every row in that scenario, grouped by table:
 
 ### File export
 
-Press `s` at the post-detail prompt to save the current scenario as a plain-text file (no ANSI escape codes). The file is written to the current working directory:
+Press `s` at the post-detail prompt to save the current scenario as a plain-text file (no ANSI escape codes). The file is written to the directory you launched the command from (not the OJS document root), with mode `0600`. If you ran the tool from the OJS install directory, it falls back to `files_dir` (or the system temp directory).
 
 ```
-  Saved: /path/to/ojs/settingsHealthCheck_locale_20260810_143022.txt
+  Saved: /home/you/settingsHealthCheck_locale_20260810_143022.txt
 ```
 
 You can export multiple scenarios in one session.

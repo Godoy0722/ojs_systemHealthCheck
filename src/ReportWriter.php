@@ -489,8 +489,40 @@ final class ReportWriter
         }
 
         $filename = 'settingsHealthCheck_' . $this->scenarioSlug($scenario) . '_' . date('Ymd_His') . '.txt';
-        $path = getcwd() . '/' . $filename;
-        return file_put_contents($path, implode("\n", $lines)) === false ? null : $path;
+        $path = $this->exportDirectory() . '/' . $filename;
+        if (file_put_contents($path, implode("\n", $lines)) === false) {
+            return null;
+        }
+        @chmod($path, 0600);
+        return $path;
+    }
+
+    private function exportDirectory(): string
+    {
+        $ojsRoot = defined('INDEX_FILE_LOCATION')
+            ? dirname(INDEX_FILE_LOCATION)
+            : getcwd();
+        $ojsReal = realpath($ojsRoot) ?: $ojsRoot;
+
+        if (defined('PWD') && PWD !== '') {
+            $pwdReal = realpath(PWD);
+            if ($pwdReal !== false && $pwdReal !== $ojsReal && is_writable($pwdReal)) {
+                return $pwdReal;
+            }
+        }
+
+        $filesDir = (string) \Config::getVar('files', 'files_dir');
+        if ($filesDir !== '') {
+            if ($filesDir[0] !== '/' && (!isset($filesDir[1]) || $filesDir[1] !== ':')) {
+                $filesDir = $ojsRoot . '/' . $filesDir;
+            }
+            if (is_dir($filesDir) && is_writable($filesDir)) {
+                $filesReal = realpath($filesDir);
+                return $filesReal !== false ? $filesReal : rtrim($filesDir, '/');
+            }
+        }
+
+        return sys_get_temp_dir();
     }
 
     /**
