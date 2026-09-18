@@ -232,16 +232,12 @@ final class IlluminateDatabaseGateway
         if (empty($settingNames) || !$this->tableExists($table)) {
             return 0;
         }
-        try {
-            return (int) Capsule::table($table)
-                ->whereIn('setting_name', $settingNames)
-                ->where(function ($q) {
-                    $q->where('locale', '')->orWhereNull('locale');
-                })
-                ->update(['locale' => $newLocale]);
-        } catch (\Throwable $e) {
-            return 0;
-        }
+        return (int) Capsule::table($table)
+            ->whereIn('setting_name', $settingNames)
+            ->where(function ($q) {
+                $q->where('locale', '')->orWhereNull('locale');
+            })
+            ->update(['locale' => $newLocale]);
     }
 
     /**
@@ -466,11 +462,7 @@ final class IlluminateDatabaseGateway
         if ($ignoreZero) {
             $sql .= ' AND s.`' . $fkCol . '` != 0';
         }
-        try {
-            return (int) Capsule::affectingStatement($sql);
-        } catch (\Throwable $e) {
-            return 0;
-        }
+        return (int) Capsule::affectingStatement($sql);
     }
 
     /**
@@ -638,7 +630,8 @@ final class IlluminateDatabaseGateway
 
     /**
      * Returns publication_settings rows whose issueId value does not match
-     * any live issues.issue_id. Matches OJS 3.4 PreflightCheckMigration.
+     * any live issues.issue_id. Casts the setting to UNSIGNED (same direction
+     * as OJS 3.4 PreflightCheckMigration) so padded/spaced numerics still match.
      *
      * @return \Generator<int, array{publication_id:int|string, submission_id:int|string, setting_value:string, locale:?string}>
      */
@@ -659,7 +652,7 @@ final class IlluminateDatabaseGateway
         try {
             $cursor = Capsule::table('publications as p')
                 ->join('publication_settings as ps', 'ps.publication_id', '=', 'p.publication_id')
-                ->leftJoin('issues as i', Capsule::raw('CAST(i.issue_id AS CHAR(20))'), '=', 'ps.setting_value')
+                ->leftJoin('issues as i', Capsule::raw('CAST(ps.setting_value AS UNSIGNED)'), '=', 'i.issue_id')
                 ->where('ps.setting_name', 'issueId')
                 ->whereNull('i.issue_id')
                 ->select([
@@ -694,7 +687,7 @@ final class IlluminateDatabaseGateway
         try {
             return (int) Capsule::table('publications as p')
                 ->join('publication_settings as ps', 'ps.publication_id', '=', 'p.publication_id')
-                ->leftJoin('issues as i', Capsule::raw('CAST(i.issue_id AS CHAR(20))'), '=', 'ps.setting_value')
+                ->leftJoin('issues as i', Capsule::raw('CAST(ps.setting_value AS UNSIGNED)'), '=', 'i.issue_id')
                 ->where('ps.setting_name', 'issueId')
                 ->whereNull('i.issue_id')
                 ->count();
@@ -719,7 +712,7 @@ final class IlluminateDatabaseGateway
         try {
             $query = Capsule::table('publications as p')
                 ->join('publication_settings as ps', 'ps.publication_id', '=', 'p.publication_id')
-                ->leftJoin('issues as i', Capsule::raw('CAST(i.issue_id AS CHAR(20))'), '=', 'ps.setting_value')
+                ->leftJoin('issues as i', Capsule::raw('CAST(ps.setting_value AS UNSIGNED)'), '=', 'i.issue_id')
                 ->where('ps.setting_name', 'issueId')
                 ->whereNull('i.issue_id');
         } catch (\Throwable $e) {
@@ -738,13 +731,9 @@ final class IlluminateDatabaseGateway
         }
         $sql = 'DELETE ps FROM `publication_settings` AS ps'
             . ' INNER JOIN `publications` AS p ON ps.`publication_id` = p.`publication_id`'
-            . ' LEFT JOIN `issues` AS i ON CAST(i.`issue_id` AS CHAR(20)) = ps.`setting_value`'
+            . ' LEFT JOIN `issues` AS i ON CAST(ps.`setting_value` AS UNSIGNED) = i.`issue_id`'
             . " WHERE ps.`setting_name` = 'issueId' AND i.`issue_id` IS NULL";
-        try {
-            return (int) Capsule::affectingStatement($sql);
-        } catch (\Throwable $e) {
-            return 0;
-        }
+        return (int) Capsule::affectingStatement($sql);
     }
 
     /**
@@ -1571,29 +1560,25 @@ final class IlluminateDatabaseGateway
         $leafAlias = 't' . $leafIdx;
         $root = $path[0];
 
-        try {
-            $sql = 'DELETE ' . $leafAlias . ' FROM `' . $path[$leafIdx]['table'] . '` AS ' . $leafAlias;
-            for ($i = $leafIdx; $i >= 1; $i--) {
-                $parent = $path[$i - 1];
-                $child = $path[$i];
-                if (!$this->columnExists($parent['table'], $parent['identity'])
-                    || !$this->columnExists($child['table'], $child['column'])) {
-                    return 0;
-                }
-                $sql .= ' INNER JOIN `' . $parent['table'] . '` AS t' . ($i - 1)
-                    . ' ON t' . ($i - 1) . '.`' . $parent['identity'] . '` = t' . $i . '.`' . $child['column'] . '`';
+        $sql = 'DELETE ' . $leafAlias . ' FROM `' . $path[$leafIdx]['table'] . '` AS ' . $leafAlias;
+        for ($i = $leafIdx; $i >= 1; $i--) {
+            $parent = $path[$i - 1];
+            $child = $path[$i];
+            if (!$this->columnExists($parent['table'], $parent['identity'])
+                || !$this->columnExists($child['table'], $child['column'])) {
+                return 0;
             }
-            $sql .= ' WHERE t0.`' . $root['column'] . '` = ' . (int) $journalId;
-            if ($root['assocType'] !== null) {
-                $sql .= ' AND t0.`assoc_type` = ' . (int) $root['assocType'];
-            }
-            if ($step['assocType'] !== null && $leafIdx > 0) {
-                $sql .= ' AND ' . $leafAlias . '.`assoc_type` = ' . (int) $step['assocType'];
-            }
-            return (int) Capsule::affectingStatement($sql);
-        } catch (\Throwable $e) {
-            return 0;
+            $sql .= ' INNER JOIN `' . $parent['table'] . '` AS t' . ($i - 1)
+                . ' ON t' . ($i - 1) . '.`' . $parent['identity'] . '` = t' . $i . '.`' . $child['column'] . '`';
         }
+        $sql .= ' WHERE t0.`' . $root['column'] . '` = ' . (int) $journalId;
+        if ($root['assocType'] !== null) {
+            $sql .= ' AND t0.`assoc_type` = ' . (int) $root['assocType'];
+        }
+        if ($step['assocType'] !== null && $leafIdx > 0) {
+            $sql .= ' AND ' . $leafAlias . '.`assoc_type` = ' . (int) $step['assocType'];
+        }
+        return (int) Capsule::affectingStatement($sql);
     }
 
     public function deleteSubmissionFileDependentsForJournal(int $journalId): int
@@ -1601,14 +1586,10 @@ final class IlluminateDatabaseGateway
         if (!$this->tableExists('submission_files') || !$this->tableExists('submissions')) {
             return 0;
         }
-        try {
-            $fileIds = Capsule::table('submission_files as sf')
-                ->join('submissions as s', 's.submission_id', '=', 'sf.submission_id')
-                ->where('s.context_id', '=', $journalId)
-                ->pluck('sf.submission_file_id');
-        } catch (\Throwable $e) {
-            return 0;
-        }
+        $fileIds = Capsule::table('submission_files as sf')
+            ->join('submissions as s', 's.submission_id', '=', 'sf.submission_id')
+            ->where('s.context_id', '=', $journalId)
+            ->pluck('sf.submission_file_id');
         if ($fileIds->isEmpty()) {
             return 0;
         }
@@ -1692,8 +1673,8 @@ final class IlluminateDatabaseGateway
     }
 
     /**
-     * Deletes one unreferenced blob via the OJS file service when possible,
-     * falling back to removing the DB row only.
+     * Deletes one unreferenced blob via the OJS file service (disk then
+     * `files` row). Failures propagate so Fixer can record a warning.
      *
      * @param int|string $fileId
      */
@@ -1702,12 +1683,8 @@ final class IlluminateDatabaseGateway
         if (!$this->tableExists('files') || $this->isFileReferenced($fileId)) {
             return 0;
         }
-        try {
-            \Services::get('file')->delete($fileId);
-            return 1;
-        } catch (\Throwable $e) {
-            return (int) Capsule::table('files')->where('file_id', $fileId)->delete();
-        }
+        \Services::get('file')->delete($fileId);
+        return 1;
     }
 
     /**

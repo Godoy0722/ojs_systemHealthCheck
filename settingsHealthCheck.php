@@ -83,7 +83,8 @@ class SettingsHealthCheckTool extends CommandLineTool
             -e, --empty            Required NULL columns and NULL setting_value
             -r, --review           REVIEW_REVISION files
             -d, --deleted-journal  Deleted journal leftovers
-            -a, --all              All checks above
+            -a, --all              Locale, orphan, empty, and deleted-journal checks
+                                   (does not include --review)
             -h, --help             This message
 
             -f, --fix              Enable fix mode; press [f] in the menu to apply.
@@ -96,6 +97,11 @@ class SettingsHealthCheckTool extends CommandLineTool
 
     public function execute(): void
     {
+        if ($this->fix && !(function_exists('stream_isatty') && stream_isatty(STDIN))) {
+            fwrite(STDERR, ReportWriter::color("[ERROR]", 'bold|red', STDERR) . " Refusing --fix with piped input. Run interactively with a real terminal.\n");
+            exit(2);
+        }
+
         $exitCode = 0;
         try {
             $gateway = new IlluminateDatabaseGateway();
@@ -109,7 +115,7 @@ class SettingsHealthCheckTool extends CommandLineTool
             $entityMap = $registry->buildEntities();
 
             foreach ($registry->getWarnings() as $w) {
-                fwrite(STDERR, ReportWriter::color("[WARN]", 'bold|yellow') . " {$w}\n");
+                fwrite(STDERR, ReportWriter::color("[WARN]", 'bold|yellow', STDERR) . " {$w}\n");
             }
 
             $cascadeRegistry = new JournalCascadeRegistry($gateway);
@@ -121,7 +127,7 @@ class SettingsHealthCheckTool extends CommandLineTool
             $stats = $writer->computeStats($allFindings);
 
             foreach ($scanner->getWarnings() as $w) {
-                fwrite(STDERR, ReportWriter::color("[WARN]", 'bold|yellow') . " {$w}\n");
+                fwrite(STDERR, ReportWriter::color("[WARN]", 'bold|yellow', STDERR) . " {$w}\n");
             }
 
             $context = $scanner->getContextStats();
@@ -171,7 +177,7 @@ class SettingsHealthCheckTool extends CommandLineTool
                     $lastPassResult = $fixResult;
                     $this->mergeFixSuccessTotals($totals, $fixResult);
                     foreach ($fixer->getWarnings() as $w) {
-                        fwrite(STDERR, ReportWriter::color("[WARN]", 'bold|yellow') . " {$w}\n");
+                        fwrite(STDERR, ReportWriter::color("[WARN]", 'bold|yellow', STDERR) . " {$w}\n");
                     }
 
                     $recheck = $this->checks;
@@ -185,7 +191,7 @@ class SettingsHealthCheckTool extends CommandLineTool
                     }
                     $findings = $scanner->scan($recheck);
                     foreach ($scanner->getWarnings() as $w) {
-                        fwrite(STDERR, ReportWriter::color("[WARN]", 'bold|yellow') . " {$w}\n");
+                        fwrite(STDERR, ReportWriter::color("[WARN]", 'bold|yellow', STDERR) . " {$w}\n");
                     }
 
                     if ($this->countFixableRows($findings) === 0) {
@@ -195,7 +201,8 @@ class SettingsHealthCheckTool extends CommandLineTool
                         fwrite(STDERR, ReportWriter::color(
                             "[WARN] Fix pass {$pass} made no progress; stopping with "
                             . $this->countFixableRows($findings) . " fixable records left.\n",
-                            'bold|yellow'
+                            'bold|yellow',
+                            STDERR
                         ));
                         break;
                     }
@@ -208,18 +215,20 @@ class SettingsHealthCheckTool extends CommandLineTool
                 if ($pass >= self::MAX_FIX_PASSES && $this->countFixableRows($findings) > 0) {
                     fwrite(STDERR, ReportWriter::color(
                         '[WARN] Reached maximum fix passes (' . self::MAX_FIX_PASSES . "); some fixable records remain.\n",
-                        'bold|yellow'
+                        'bold|yellow',
+                        STDERR
                     ));
                 }
 
                 $stats = $writer->computeStats($findings);
                 $remainingFixable = $this->countFixableRows($findings);
                 echo $this->renderFixSummary($totals, $pass, $remainingFixable, $lastPassResult, $findings);
+                $exitCode = $remainingFixable > 0 ? 1 : 0;
+            } else {
+                $exitCode = $stats > 0 ? 1 : 0;
             }
-
-            $exitCode = $stats > 0 ? 1 : 0;
         } catch (\Throwable $e) {
-            fwrite(STDERR, ReportWriter::color("[ERROR]", 'bold|red') . " {$e->getMessage()}\n");
+            fwrite(STDERR, ReportWriter::color("[ERROR]", 'bold|red', STDERR) . " {$e->getMessage()}\n");
             $exitCode = 2;
         }
         exit($exitCode);
@@ -260,7 +269,6 @@ class SettingsHealthCheckTool extends CommandLineTool
                     $selected[Scanner::CHECK_LOCALE] = true;
                     $selected[Scanner::CHECK_ORPHAN] = true;
                     $selected[Scanner::CHECK_EMPTY] = true;
-                    $selected[Scanner::CHECK_REVIEW] = true;
                     $selected[Scanner::CHECK_JOURNAL] = true;
                     break;
                 case '-f':
@@ -268,7 +276,7 @@ class SettingsHealthCheckTool extends CommandLineTool
                     $this->fix = true;
                     break;
                 default:
-                    fwrite(STDERR, ReportWriter::color("[ERROR]", 'bold|red') . " Unknown argument: {$arg}\n");
+                    fwrite(STDERR, ReportWriter::color("[ERROR]", 'bold|red', STDERR) . " Unknown argument: {$arg}\n");
                     $this->usage();
                     exit(2);
             }
@@ -488,7 +496,7 @@ class SettingsHealthCheckTool extends CommandLineTool
     private function confirmDestructiveFix(array $warningLines, string $confirmWord = 'DELETE'): void
     {
         if (!(function_exists('stream_isatty') && stream_isatty(STDIN))) {
-            fwrite(STDERR, ReportWriter::color("[ERROR]", 'bold|red') . " Refusing --fix with piped input. Run interactively with a real terminal.\n");
+            fwrite(STDERR, ReportWriter::color("[ERROR]", 'bold|red', STDERR) . " Refusing --fix with piped input. Run interactively with a real terminal.\n");
             exit(2);
         }
 
@@ -504,13 +512,13 @@ class SettingsHealthCheckTool extends CommandLineTool
             ? 'Stage 1/3: Are you aware that this operation will delete data in the database? (yes/no): '
             : 'Stage 1/3: Are you aware that this operation will UPDATE rows in the database? (yes/no): ';
         echo $stage1;
-        if (strtolower(trim((string) fgets(STDIN))) !== 'yes') {
+        if (strtolower(ReportWriter::readStdinLine()) !== 'yes') {
             echo ReportWriter::color("Aborted: User did not confirm awareness of the database change.\n", 'yellow');
             exit(1);
         }
 
         echo 'Stage 2/3: Do you really want to execute this operation in the database? This is your second confirmation. (yes/no): ';
-        if (strtolower(trim((string) fgets(STDIN))) !== 'yes') {
+        if (strtolower(ReportWriter::readStdinLine()) !== 'yes') {
             echo ReportWriter::color("Aborted: User did not provide the second confirmation.\n", 'yellow');
             exit(1);
         }
@@ -519,7 +527,7 @@ class SettingsHealthCheckTool extends CommandLineTool
             ? "Stage 3/3: This is the final confirmation. This will permanently delete files and database records. Confirm by typing 'DELETE': "
             : "Stage 3/3: This is the final confirmation. This will permanently UPDATE locale tags. Confirm by typing 'UPDATE': ";
         echo $stage3;
-        if (trim((string) fgets(STDIN)) !== $confirmWord) {
+        if (ReportWriter::readStdinLine() !== $confirmWord) {
             echo ReportWriter::color("Aborted: Final confirmation mismatch.\n", 'yellow');
             exit(1);
         }

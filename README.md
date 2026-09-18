@@ -19,9 +19,9 @@ php tools/settingsHealthCheck/settingsHealthCheck.php [--flags]
 | `-l`, `--locale` | Bad locale tags — multilingual settings rows stored with empty/null `locale` (PHP 8 corruption risk). See [locale coverage](docs/locale-coverage.md). |
 | `-o`, `--orphan` | Orphaned settings, invalid entity FK refs in live journals, and unreferenced blob files. See [orphan entity coverage](docs/orphan-entity-coverage.md). |
 | `-e`, `--empty`  | Empty fields — required columns that are `NULL` + settings with `NULL` values |
-| `-r`, `--review` | Review revision files — files stuck in `REVIEW_REVISION` status (causes fatal error on journal deletion) |
+| `-r`, `--review` | Review revision files — files stuck in `REVIEW_REVISION` status (causes fatal error on journal deletion). **Not** part of `--all`; pass this flag explicitly |
 | `-d`, `--deleted-journal` | Deleted journal leftovers — rows still referencing a journal that no longer exists |
-| `-a`, `--all`    | Run every check above |
+| `-a`, `--all`    | Locale, orphan, empty, and deleted-journal checks. Does **not** include `--review` |
 | `-h`, `--help`   | Show usage message |
 
 You can combine flags. E.g.: `--orphan --empty` runs both.

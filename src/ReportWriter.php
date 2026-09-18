@@ -35,15 +35,19 @@ final class ReportWriter
         $this->expander = $expander;
     }
 
+    /** @var array<int, bool> */
+    private static array $supportsColorByStream = [];
+
     /**
      * Wrap $text in ANSI color codes. Multiple colors combined via pipe,
-     * e.g. "bold|red". Pass empty string to skip wrapping.
+     * e.g. "bold|red". Pass empty string to skip wrapping. $stream is the
+     * destination (STDOUT for the report, STDERR for progress/warnings).
+     *
+     * @param resource $stream
      */
-    private static ?bool $supportsColor = null;
-
-    public static function color(string $text, string $color): string
+    public static function color(string $text, string $color, $stream = STDOUT): string
     {
-        if ($color === '' || !self::supportsColor()) {
+        if ($color === '' || !self::supportsColor($stream)) {
             return $text;
         }
         $codes = [];
@@ -59,14 +63,21 @@ final class ReportWriter
         return implode('', $codes) . $text . self::C_RESET;
     }
 
-    private static function supportsColor(): bool
+    /** @param resource $stream */
+    private static function supportsColor($stream): bool
     {
-        if (self::$supportsColor !== null) {
-            return self::$supportsColor;
+        $id = (int) $stream;
+        if (!isset(self::$supportsColorByStream[$id])) {
+            self::$supportsColorByStream[$id] = function_exists('stream_isatty') && stream_isatty($stream)
+                && getenv('NO_COLOR') === false;
         }
-        self::$supportsColor = function_exists('stream_isatty') && stream_isatty(STDOUT)
-            && getenv('NO_COLOR') === false;
-        return self::$supportsColor;
+        return self::$supportsColorByStream[$id];
+    }
+
+    public static function readStdinLine(): string
+    {
+        $line = fgets(STDIN);
+        return $line === false ? '' : trim($line);
     }
 
     /**
@@ -335,7 +346,7 @@ final class ReportWriter
 
             echo $c($menuPrompt, 'bold');
 
-            $input = strtolower(trim(fgets(STDIN)));
+            $input = strtolower(self::readStdinLine());
             echo "\n";
 
             if ($input === 'q') {
@@ -374,7 +385,7 @@ final class ReportWriter
 
             while (true) {
                 echo "\n" . $c($detailPrompt, 'bold');
-                $input2 = strtolower(trim(fgets(STDIN)));
+                $input2 = strtolower(self::readStdinLine());
                 if ($input2 === 'q') {
                     echo "\n  " . $c('Done — no fixes applied.', 'green') . "\n\n";
                     return false;

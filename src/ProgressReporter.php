@@ -40,12 +40,9 @@ final class ProgressReporter
             $scenario
         );
         $progress = sprintf('[%s] %3d%% (%d/%d)', $bar, $pct, $this->current, $this->total);
-        $line = $status . "\n" . $progress;
 
         if ($this->tty) {
             fwrite(STDERR, "\033[2K\r" . $status . "\n\033[2K\r" . $progress);
-        } else {
-            fwrite(STDERR, $line . "\n");
         }
     }
 
@@ -54,7 +51,7 @@ final class ProgressReporter
         if ($this->tty) {
             fwrite(STDERR, "\033[2K\r");
         }
-        fwrite(STDERR, ReportWriter::color($text, 'cyan') . "\n");
+        fwrite(STDERR, ReportWriter::color($text, 'cyan', STDERR) . "\n");
     }
 
     public function finish(string $label = 'Scan complete.'): void
@@ -62,6 +59,6 @@ final class ProgressReporter
         if ($this->tty) {
             fwrite(STDERR, "\033[2K\r");
         }
-        fwrite(STDERR, ReportWriter::color($label, 'green') . "\n");
+        fwrite(STDERR, ReportWriter::color($label, 'green', STDERR) . "\n");
     }
 }
