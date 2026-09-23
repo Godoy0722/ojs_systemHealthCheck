@@ -225,22 +225,6 @@ final class IlluminateDatabaseGateway
     }
 
     /**
-     * Sets locale on all rows with empty/NULL locale for the given setting names.
-     */
-    public function fixEmptyLocales(string $table, array $settingNames, string $newLocale): int
-    {
-        if (empty($settingNames) || !$this->tableExists($table)) {
-            return 0;
-        }
-        return (int) Capsule::table($table)
-            ->whereIn('setting_name', $settingNames)
-            ->where(function ($q) {
-                $q->where('locale', '')->orWhereNull('locale');
-            })
-            ->update(['locale' => $newLocale]);
-    }
-
-    /**
      * Auto-discovers setting names that have both localized and non-localized
      * rows within the same table (mixed-locale pattern used by Pass B).
      *
@@ -759,28 +743,6 @@ final class IlluminateDatabaseGateway
     }
 
     /**
-     * Sets the locale on a single settings row to the given replacement.
-     *
-     * @param string $table Settings table name
-     * @param int|string $pk Primary-key value
-     * @param string $settingName
-     * @param string|null $oldLocale Current (empty) locale to match
-     * @param string $newLocale Replacement locale
-     * @return int Number of rows updated
-     */
-    public function setSettingRowLocale(string $table, $pk, string $settingName, ?string $oldLocale, string $newLocale): int
-    {
-        if (!$this->tableExists($table)) {
-            return 0;
-        }
-        $query = $this->buildRowQuery($table, $pk, $settingName, $oldLocale);
-        if ($query === null) {
-            return 0;
-        }
-        return (int) $query->update(['locale' => $newLocale]);
-    }
-
-    /**
      * Builds an Illuminate query scoped to exactly one offending row.
      * Surrogate-key tables (OJS 3.5) are pinned by PK alone;
      * composite-key tables (OJS 3.3) add setting_name and locale clauses
@@ -825,6 +787,278 @@ final class IlluminateDatabaseGateway
             return;
         }
         $query->where('locale', $locale);
+    }
+
+    /**
+     * Columns identifying one multilingual field value regardless of its
+     * locale: the unique-index columns minus `locale` (e.g. publication_id +
+     * setting_name, or user_id + setting_name + assoc_type + assoc_id).
+     * Surrogate-key tables fall back to the entity FK + setting_name.
+     *
+     * @return string[]
+     */
+    public function getLocaleGroupColumns(string $table): array
+    {
+        $columns = array_values(array_diff($this->getPrimaryKeyColumns($table), ['locale']));
+        if (in_array('setting_name', $columns, true)) {
+            return $columns;
+        }
+        $meta = $this->getTableMeta($table);
+        $columns = $meta['fk'] !== null ? [$meta['fk'], 'setting_name'] : ['setting_name'];
+        foreach (['assoc_type', 'assoc_id'] as $assocColumn) {
+            if ($this->columnExists($table, $assocColumn)) {
+                $columns[] = $assocColumn;
+            }
+        }
+        return $columns;
+    }
+
+    /**
+     * One page of empty/NULL-locale rows for the given setting names, ordered
+     * by the field group columns so offset paging stays stable while rows are
+     * retagged or deleted between pages.
+     *
+     * @param string[] $groupColumns From getLocaleGroupColumns()
+     * @param string[] $settingNames
+     * @param array<string, mixed> $filters Extra column => value equality filters
+     * @return array<int, array{group: array<string, mixed>, locale: ?string}>
+     */
+    public function findEmptyLocaleRowsPage(
+        string $table,
+        array $groupColumns,
+        array $settingNames,
+        array $filters,
+        int $offset,
+        int $limit
+    ): array {
+        if (empty($settingNames) || empty($groupColumns) || !$this->tableExists($table)) {
+            return [];
+        }
+        $query = Capsule::table($table)
+            ->select(array_merge($groupColumns, ['locale']))
+            ->whereIn('setting_name', $settingNames)
+            ->where(function ($q) {
+                $q->where('locale', '')->orWhereNull('locale');
+            });
+        foreach ($filters as $column => $value) {
+            $query->where($column, $value);
+        }
+        foreach ($groupColumns as $column) {
+            $query->orderBy($column);
+        }
+        $rows = [];
+        foreach ($query->offset($offset)->limit($limit)->get() as $row) {
+            $group = [];
+            foreach ($groupColumns as $column) {
+                $group[$column] = $row->{$column} ?? null;
+            }
+            $rows[] = ['group' => $group, 'locale' => $row->locale ?? null];
+        }
+        return $rows;
+    }
+
+    /**
+     * Distinct non-empty locales already stored for one field group.
+     *
+     * @param array<string, mixed> $group
+     * @return string[]
+     */
+    public function getTaggedLocales(string $table, array $group): array
+    {
+        $query = Capsule::table($table)
+            ->select('locale')
+            ->distinct()
+            ->where('locale', '<>', '')
+            ->whereNotNull('locale');
+        $this->applyGroupClause($query, $group);
+        return array_map(function ($row) {
+            return (string) $row->locale;
+        }, $query->get()->all());
+    }
+
+    /**
+     * Retags exactly one empty/NULL-locale row of a field group.
+     *
+     * @param array<string, mixed> $group
+     * @param string|null $currentLocale '' or NULL, matched exactly
+     */
+    public function retagEmptyLocaleRow(string $table, array $group, ?string $currentLocale, string $newLocale): int
+    {
+        $query = Capsule::table($table);
+        $this->applyGroupClause($query, $group);
+        $this->applyExactEmptyLocale($query, $currentLocale);
+        return (int) $query->limit(1)->update(['locale' => $newLocale]);
+    }
+
+    /**
+     * Deletes exactly one empty/NULL-locale row of a field group.
+     *
+     * @param array<string, mixed> $group
+     * @param string|null $currentLocale '' or NULL, matched exactly
+     */
+    public function deleteEmptyLocaleRow(string $table, array $group, ?string $currentLocale): int
+    {
+        $query = Capsule::table($table);
+        $this->applyGroupClause($query, $group);
+        $this->applyExactEmptyLocale($query, $currentLocale);
+        return (int) $query->limit(1)->delete();
+    }
+
+    /**
+     * @param \Illuminate\Database\Query\Builder $query
+     * @param array<string, mixed> $group
+     */
+    private function applyGroupClause($query, array $group): void
+    {
+        foreach ($group as $column => $value) {
+            $value === null ? $query->whereNull($column) : $query->where($column, $value);
+        }
+    }
+
+    /**
+     * @param \Illuminate\Database\Query\Builder $query
+     */
+    private function applyExactEmptyLocale($query, ?string $locale): void
+    {
+        $locale === null ? $query->whereNull('locale') : $query->where('locale', '');
+    }
+
+    /**
+     * Locales each live journal accepts content in, primary locale first.
+     * Uses supportedFormLocales (the locales multilingual fields are edited
+     * in), falling back to supportedLocales.
+     *
+     * @return array<int, string[]> journal_id => ordered locales
+     */
+    public function getJournalLocales(): array
+    {
+        if (!$this->tableExists('journals')) {
+            return [];
+        }
+        $journals = [];
+        foreach (Capsule::table('journals')->select('journal_id', 'primary_locale')->get() as $row) {
+            $journals[(int) $row->journal_id] = [
+                'primary' => (string) ($row->primary_locale ?? ''),
+                'supportedFormLocales' => [],
+                'supportedLocales' => [],
+            ];
+        }
+        if (!empty($journals) && $this->tableExists('journal_settings')) {
+            $rows = Capsule::table('journal_settings')
+                ->select('journal_id', 'setting_name', 'setting_value')
+                ->whereIn('setting_name', ['supportedFormLocales', 'supportedLocales'])
+                ->get();
+            foreach ($rows as $row) {
+                $journalId = (int) $row->journal_id;
+                if (isset($journals[$journalId])) {
+                    $journals[$journalId][(string) $row->setting_name] = self::decodeLocaleList($row->setting_value);
+                }
+            }
+        }
+        $out = [];
+        foreach ($journals as $journalId => $j) {
+            $supported = !empty($j['supportedFormLocales']) ? $j['supportedFormLocales'] : $j['supportedLocales'];
+            $out[$journalId] = self::orderLocales($j['primary'], $supported);
+        }
+        return $out;
+    }
+
+    /**
+     * Site-level locales (site.supported_locales), primary locale first.
+     * Used for rows that do not belong to any live journal.
+     *
+     * @return string[]
+     */
+    public function getSiteLocales(): array
+    {
+        $supported = [];
+        try {
+            $row = Capsule::table('site')->select('supported_locales')->first();
+            $supported = self::decodeLocaleList(is_object($row) ? ($row->supported_locales ?? null) : null);
+        } catch (\Throwable $e) {
+            // primary locale alone
+        }
+        return self::orderLocales($this->getSitePrimaryLocale(), $supported);
+    }
+
+    /**
+     * Resolves the journal owning a settings row by walking the cascade path
+     * from the row's parent up to its journal root.
+     *
+     * @param array{table:string, identity:string, source:string, column:string, parent:?string, assocType:?int} $step Plan step of the settings table
+     * @param array<string, array{table:string, identity:string, source:string, column:string, parent:?string, assocType:?int}> $planByTable
+     * @param mixed $fkValue Value of the settings row's $step['column']
+     */
+    public function resolveJournalIdForSettingsRow(array $step, array $planByTable, $fkValue): ?int
+    {
+        if ($fkValue === null) {
+            return null;
+        }
+        if ($step['source'] === 'journal') {
+            return $step['assocType'] === null ? (int) $fkValue : null;
+        }
+        $path = $this->buildDeadJournalCascadePath($step, $planByTable);
+        if ($path === null) {
+            return null;
+        }
+        array_pop($path);
+        $root = $path[0];
+        $query = Capsule::table($root['table'] . ' as t0')->select('t0.' . $root['column'] . ' as jid');
+        for ($i = 1; $i < count($path); $i++) {
+            $query->join(
+                $path[$i]['table'] . ' as t' . $i,
+                't' . ($i - 1) . '.' . $path[$i - 1]['identity'],
+                '=',
+                't' . $i . '.' . $path[$i]['column']
+            );
+            if ($path[$i]['assocType'] !== null) {
+                $query->where('t' . $i . '.assoc_type', $path[$i]['assocType']);
+            }
+        }
+        if ($root['assocType'] !== null) {
+            $query->where('t0.assoc_type', $root['assocType']);
+        }
+        $last = count($path) - 1;
+        $row = $query->where('t' . $last . '.' . $path[$last]['identity'], $fkValue)->first();
+        return is_object($row) && $row->jid !== null ? (int) $row->jid : null;
+    }
+
+    /**
+     * Decodes a stored locale list (JSON in OJS 3.3, PHP-serialized in older data).
+     *
+     * @param mixed $value
+     * @return string[]
+     */
+    private static function decodeLocaleList($value): array
+    {
+        if (!is_string($value) || $value === '') {
+            return [];
+        }
+        $decoded = json_decode($value, true);
+        if (!is_array($decoded)) {
+            $decoded = @unserialize($value, ['allowed_classes' => false]);
+        }
+        if (!is_array($decoded)) {
+            return [];
+        }
+        return array_values(array_filter($decoded, function ($locale) {
+            return is_string($locale) && $locale !== '';
+        }));
+    }
+
+    /**
+     * @param string[] $supported
+     * @return string[]
+     */
+    private static function orderLocales(string $primary, array $supported): array
+    {
+        $ordered = $primary !== '' ? [$primary] : [];
+        foreach ($supported as $locale) {
+            if (!in_array($locale, $ordered, true)) {
+                $ordered[] = $locale;
+            }
+        }
+        return $ordered;
     }
 
     /**

@@ -728,7 +728,9 @@ final class ReportWriter
             $lines[] = '      ' . str_pad($valueLabel, 7) . ' : ' . $this->truncate($f->valuePreview, 100);
         }
 
-        if ($f->suggestedLocale !== '' && !Finding::isEntityOrphan($f)) {
+        if ($f->reason === Finding::REASON_SCHEMA_MISSING_LOCALE || $f->reason === Finding::REASON_HEURISTIC_LOCALE_MISMATCH) {
+            $lines[] = '      Suggest : tag with a journal locale not yet set for this field, or delete if all are set';
+        } elseif ($f->suggestedLocale !== '' && !Finding::isEntityOrphan($f)) {
             $lines[] = '      Suggest : tag this row with locale "' . $f->suggestedLocale . '"';
         }
         $lines[] = '';

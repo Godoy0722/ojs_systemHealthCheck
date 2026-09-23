@@ -129,7 +129,7 @@ final class FindingExpander
                 $row['locale'],
                 $row['setting_value'],
                 $reason,
-                $finding->suggestedLocale !== '' ? $finding->suggestedLocale : 'en'
+                ''
             );
         }
         return $expanded !== [] ? $expanded : [$finding];

@@ -32,6 +32,7 @@ require_once(dirname(__FILE__) . '/src/AssocLeftoverRegistry.php');
 require_once(dirname(__FILE__) . '/src/OrphanReferenceCleaner.php');
 require_once(dirname(__FILE__) . '/src/FindingExpander.php');
 require_once(dirname(__FILE__) . '/src/ProgressReporter.php');
+require_once(dirname(__FILE__) . '/src/MissingLocaleResolver.php');
 require_once(dirname(__FILE__) . '/src/Fixer.php');
 
 use APP\tools\settingsHealthCheck\src\EntityReferenceRule;
@@ -147,6 +148,7 @@ class SettingsHealthCheckTool extends CommandLineTool
                     'entityReferencesRecovered' => 0,
                     'entityOrphansFixed' => 0,
                     'localesFixed' => 0,
+                    'localeDuplicatesDeleted' => 0,
                     'reviewFilesDeleted' => 0,
                     'journalRecordsDeleted' => 0,
                 ];
@@ -207,7 +209,7 @@ class SettingsHealthCheckTool extends CommandLineTool
                         break;
                     }
                     if ($pass >= 2 && ($fixResult['orphansDeleted'] + $fixResult['localesFixed']
-                        + $fixResult['entityOrphansFixed'] + $fixResult['reviewFilesDeleted']) === 0) {
+                        + $fixResult['localeDuplicatesDeleted'] + $fixResult['entityOrphansFixed'] + $fixResult['reviewFilesDeleted']) === 0) {
                         break;
                     }
                 }
@@ -365,11 +367,13 @@ class SettingsHealthCheckTool extends CommandLineTool
         $prompts = [
             [
                 $locale,
-                'UPDATE',
+                'DELETE',
                 [
                     'Scenario: Bad locale tags (' . $locale . ' row(s)).',
                     'Multilingual settings were stored with an empty locale tag, which PHP 8 cannot hydrate.',
-                    'The fix UPDATES those rows to the site/journal primary locale. No rows are deleted.',
+                    'Each row is checked against the locales of its journal (site locales when it has no journal):',
+                    'it is UPDATED to a journal locale not yet set for that field (primary locale first),',
+                    'or DELETED when every journal locale is already set for that field.',
                 ],
             ],
             [$entityNullify, 'UPDATE', $nullifyLines],
@@ -414,22 +418,23 @@ class SettingsHealthCheckTool extends CommandLineTool
         return $total;
     }
 
-    /** @param array{orphansDeleted:int, orphanFilesDeleted:int, entityReferencesRecovered:int, entityOrphansFixed:int, localesFixed:int, reviewFilesDeleted:int, journalRecordsDeleted:int, alreadyRemoved:int, skipped:int, failed:int} $result */
+    /** @param array{orphansDeleted:int, orphanFilesDeleted:int, entityReferencesRecovered:int, entityOrphansFixed:int, localesFixed:int, localeDuplicatesDeleted:int, reviewFilesDeleted:int, journalRecordsDeleted:int, alreadyRemoved:int, skipped:int, failed:int} $result */
     private function fixMadeProgress(array $result): bool
     {
         return ($result['orphansDeleted'] + $result['orphanFilesDeleted'] + $result['entityReferencesRecovered']
-            + $result['entityOrphansFixed'] + $result['localesFixed'] + $result['reviewFilesDeleted']
+            + $result['entityOrphansFixed'] + $result['localesFixed'] + $result['localeDuplicatesDeleted']
+            + $result['reviewFilesDeleted']
             + $result['journalRecordsDeleted'] + $result['alreadyRemoved']) > 0;
     }
 
     /**
-     * @param array{orphansDeleted:int, orphanFilesDeleted:int, entityReferencesRecovered:int, entityOrphansFixed:int, localesFixed:int, reviewFilesDeleted:int, journalRecordsDeleted:int, alreadyRemoved:int, skipped:int, failed:int} $totals
-     * @param array{orphansDeleted:int, orphanFilesDeleted:int, entityReferencesRecovered:int, entityOrphansFixed:int, localesFixed:int, reviewFilesDeleted:int, journalRecordsDeleted:int, alreadyRemoved:int, skipped:int, failed:int} $pass
+     * @param array{orphansDeleted:int, orphanFilesDeleted:int, entityReferencesRecovered:int, entityOrphansFixed:int, localesFixed:int, localeDuplicatesDeleted:int, reviewFilesDeleted:int, journalRecordsDeleted:int, alreadyRemoved:int, skipped:int, failed:int} $totals
+     * @param array{orphansDeleted:int, orphanFilesDeleted:int, entityReferencesRecovered:int, entityOrphansFixed:int, localesFixed:int, localeDuplicatesDeleted:int, reviewFilesDeleted:int, journalRecordsDeleted:int, alreadyRemoved:int, skipped:int, failed:int} $pass
      */
     private function mergeFixSuccessTotals(array &$totals, array $pass): void
     {
         foreach (['orphansDeleted', 'orphanFilesDeleted', 'entityReferencesRecovered', 'entityOrphansFixed',
-            'localesFixed', 'reviewFilesDeleted', 'journalRecordsDeleted'] as $key) {
+            'localesFixed', 'localeDuplicatesDeleted', 'reviewFilesDeleted', 'journalRecordsDeleted'] as $key) {
             $totals[$key] += $pass[$key];
         }
     }
@@ -447,8 +452,8 @@ class SettingsHealthCheckTool extends CommandLineTool
     }
 
     /**
-     * @param array{orphansDeleted:int, orphanFilesDeleted:int, entityReferencesRecovered:int, entityOrphansFixed:int, localesFixed:int, reviewFilesDeleted:int, journalRecordsDeleted:int, alreadyRemoved:int, skipped:int, failed:int} $totals
-     * @param array{orphansDeleted:int, orphanFilesDeleted:int, entityReferencesRecovered:int, entityOrphansFixed:int, localesFixed:int, reviewFilesDeleted:int, journalRecordsDeleted:int, alreadyRemoved:int, skipped:int, failed:int}|null $lastPass
+     * @param array{orphansDeleted:int, orphanFilesDeleted:int, entityReferencesRecovered:int, entityOrphansFixed:int, localesFixed:int, localeDuplicatesDeleted:int, reviewFilesDeleted:int, journalRecordsDeleted:int, alreadyRemoved:int, skipped:int, failed:int} $totals
+     * @param array{orphansDeleted:int, orphanFilesDeleted:int, entityReferencesRecovered:int, entityOrphansFixed:int, localesFixed:int, localeDuplicatesDeleted:int, reviewFilesDeleted:int, journalRecordsDeleted:int, alreadyRemoved:int, skipped:int, failed:int}|null $lastPass
      * @param Finding[] $finalFindings
      */
     private function renderFixSummary(array $totals, int $passes, int $remainingFixable, ?array $lastPass, array $finalFindings): string
@@ -472,6 +477,7 @@ class SettingsHealthCheckTool extends CommandLineTool
         $lines[] = sprintf('  Orphan blob files del : %s', $c((string) $totals['orphanFilesDeleted'], 'green'));
         $lines[] = sprintf('  Entity orphans fixed  : %s', $c((string) $totals['entityOrphansFixed'], 'green'));
         $lines[] = sprintf('  Missing locales set   : %s', $c((string) $totals['localesFixed'], 'green'));
+        $lines[] = sprintf('  Locale dupes deleted  : %s', $c((string) $totals['localeDuplicatesDeleted'], 'green'));
         $lines[] = sprintf('  Review files deleted  : %s', $c((string) $totals['reviewFilesDeleted'], 'green'));
         $lines[] = sprintf('  Journal rows deleted  : %s', $c((string) $totals['journalRecordsDeleted'], 'green'));
         $lines[] = sprintf('  Empty fields skipped  : %s  (no auto-fix yet)', $c((string) $skipped, 'yellow'));

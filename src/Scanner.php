@@ -52,8 +52,6 @@ final class Scanner
     /** @var string[] */
     private array $unmappedTables = [];
 
-    private string $primaryLocale = 'en';
-
     private bool $initialized = false;
 
     /** @var Finding[] */
@@ -98,7 +96,6 @@ final class Scanner
         $this->schemaMap = $schemaMap;
         $this->entityMap = $entityMap;
         $this->contextStats['database'] = $this->gateway->getDatabaseName();
-        $this->primaryLocale = $this->gateway->getSitePrimaryLocale();
         $this->contextStats['schemaMapped'] = count($schemaMap);
 
         $discovered = $this->gateway->discoverSettingsTables();
@@ -198,7 +195,7 @@ final class Scanner
                         null,
                         null,
                         Finding::REASON_SCHEMA_MISSING_LOCALE,
-                        $this->primaryLocale,
+                        '',
                         $count
                     );
                 }

@@ -33,7 +33,7 @@ Add `-f` or `--fix` to apply remediations:
 | Finding type | Fix applied |
 |-------------|-------------|
 | Orphaned rows | Settings rows are **deleted** (FK orphans and invalid `issueId`). Invalid entity FK columns in live journals are **repointed first** (`current_publication_id`, `section_id`), then remaining orphans are **deleted or set to NULL**. Audit history keeps the row when the object still exists (NULLIFY or leave the actor FK). Leftover rows whose `assoc_type`/`assoc_id` parent is gone are **deleted**. Unreferenced blob files are **deleted from disk and the database** |
-| Missing locales | Retags existing bad rows with the site's primary locale |
+| Missing locales | Row by row: **retagged** with a journal locale not yet set for that field (primary first), or **deleted** when every journal locale is already set. See [locale coverage](docs/locale-coverage.md) |
 | Empty fields | **Skipped** — no safe automatic fix; reported for manual review |
 | Review revision files | Files and all associated DB records are **deleted** after 3-stage confirmation |
 | Deleted journal leftovers | Every leftover row is **deleted**, deepest table first, one transaction per journal, after 3-stage confirmation |
@@ -198,16 +198,19 @@ $ php tools/settingsHealthCheck.php --locale --fix
   ================================================================================
   Scenario: Bad locale tags (11 row(s)).
   Multilingual settings were stored with an empty locale tag, which PHP 8 cannot hydrate.
-  The fix UPDATES those rows to the site/journal primary locale. No rows are deleted.
+  Each row is checked against the locales of its journal (site locales when it has no journal):
+  it is UPDATED to a journal locale not yet set for that field (primary locale first),
+  or DELETED when every journal locale is already set for that field.
   ================================================================================
 
-  Stage 1/3: Are you aware that this operation will UPDATE rows in the database? (yes/no): yes
+  Stage 1/3: Are you aware that this operation will delete data in the database? (yes/no): yes
   ...
-  Stage 3/3: Confirm by typing 'UPDATE': UPDATE
+  Stage 3/3: Confirm by typing 'DELETE': DELETE
 
   Fixes applied
   -------------
-  Missing locales set   : 11
+  Missing locales set   : 8
+  Locale dupes deleted  : 3
 ```
 
 ## Example: Review Fix with Confirmation

@@ -32,8 +32,6 @@ final class Fixer
     /** @var ProgressReporter|null */
     private $progress = null;
 
-    private string $defaultLocale;
-
     /** @var string[] */
     private array $warnings = [];
 
@@ -41,8 +39,6 @@ final class Fixer
     {
         $this->gateway = $gateway;
         $this->cascadeRegistry = $cascadeRegistry;
-        $locale = $gateway->getSitePrimaryLocale();
-        $this->defaultLocale = $locale !== '' ? $locale : 'en';
     }
 
     public function setProgress(?ProgressReporter $progress): void
@@ -111,7 +107,7 @@ final class Fixer
 
     /**
      * @param Finding[] $findings
-     * @return array{orphansDeleted:int, orphanFilesDeleted:int, entityReferencesRecovered:int, entityOrphansFixed:int, localesFixed:int, reviewFilesDeleted:int, journalRecordsDeleted:int, alreadyRemoved:int, skipped:int, failed:int}
+     * @return array{orphansDeleted:int, orphanFilesDeleted:int, entityReferencesRecovered:int, entityOrphansFixed:int, localesFixed:int, localeDuplicatesDeleted:int, reviewFilesDeleted:int, journalRecordsDeleted:int, alreadyRemoved:int, skipped:int, failed:int}
      */
     public function fix(array $findings): array
     {
@@ -121,6 +117,7 @@ final class Fixer
             'entityReferencesRecovered' => 0,
             'entityOrphansFixed' => 0,
             'localesFixed' => 0,
+            'localeDuplicatesDeleted' => 0,
             'reviewFilesDeleted' => 0,
             'journalRecordsDeleted' => 0,
             'alreadyRemoved' => 0,
@@ -129,6 +126,7 @@ final class Fixer
         ];
 
         $entityCleaner = new OrphanReferenceCleaner($this->gateway);
+        $localeResolver = new MissingLocaleResolver($this->gateway, $this->cascadeRegistry);
         if ($this->hasEntityOrphanFindings($findings)) {
             $result['entityReferencesRecovered'] = $entityCleaner->recoverReferences(function (string $table): void {
                 $this->reportStep($table, self::SCENARIO_RECOVER);
@@ -151,7 +149,7 @@ final class Fixer
                         continue;
                     }
                     $fixedBulk[$bulkKey] = true;
-                    if ($this->fixBulkFinding($finding, $entityCleaner, $result)) {
+                    if ($this->fixBulkFinding($finding, $entityCleaner, $localeResolver, $result)) {
                         continue;
                     }
                 }
@@ -205,15 +203,11 @@ final class Fixer
                     case Finding::REASON_SCHEMA_MISSING_LOCALE:
                     case Finding::REASON_HEURISTIC_LOCALE_MISMATCH:
                         $this->reportStep($finding->table, self::SCENARIO_LOCALE);
-                        $locale = $finding->suggestedLocale !== '' ? $finding->suggestedLocale : $this->defaultLocale;
-                        $updated = $this->gateway->setSettingRowLocale(
-                            $finding->table,
-                            $finding->pk,
-                            $finding->settingName,
-                            $finding->locale,
-                            $locale
+                        $this->applyLocaleResolution(
+                            $localeResolver->resolve($finding->table, [$finding->settingName], $finding->pk),
+                            1,
+                            $result
                         );
-                        $updated > 0 ? $result['localesFixed'] += $updated : $result['failed']++;
                         break;
 
                     case Finding::REASON_REVIEW_REVISION:
@@ -237,7 +231,7 @@ final class Fixer
             }
         }
 
-        foreach ($entityCleaner->getWarnings() as $w) {
+        foreach (array_merge($entityCleaner->getWarnings(), $localeResolver->getWarnings()) as $w) {
             $this->warnings[] = $w;
         }
 
@@ -245,10 +239,28 @@ final class Fixer
     }
 
     /**
-     * @param array{orphansDeleted:int, orphanFilesDeleted:int, entityReferencesRecovered:int, entityOrphansFixed:int, localesFixed:int, reviewFilesDeleted:int, journalRecordsDeleted:int, alreadyRemoved:int, skipped:int, failed:int} $result
+     * @param array{retagged:int, deleted:int, failed:int} $resolution
+     * @param array{localesFixed:int, localeDuplicatesDeleted:int, failed:int} $result
      */
-    private function fixBulkFinding(Finding $finding, OrphanReferenceCleaner $entityCleaner, array &$result): bool
+    private function applyLocaleResolution(array $resolution, int $expectedRows, array &$result): void
     {
+        $result['localesFixed'] += $resolution['retagged'];
+        $result['localeDuplicatesDeleted'] += $resolution['deleted'];
+        $result['failed'] += $resolution['failed'];
+        if ($resolution['retagged'] + $resolution['deleted'] + $resolution['failed'] === 0 && $expectedRows > 0) {
+            $result['failed']++;
+        }
+    }
+
+    /**
+     * @param array{orphansDeleted:int, orphanFilesDeleted:int, entityReferencesRecovered:int, entityOrphansFixed:int, localesFixed:int, localeDuplicatesDeleted:int, reviewFilesDeleted:int, journalRecordsDeleted:int, alreadyRemoved:int, skipped:int, failed:int} $result
+     */
+    private function fixBulkFinding(
+        Finding $finding,
+        OrphanReferenceCleaner $entityCleaner,
+        MissingLocaleResolver $localeResolver,
+        array &$result
+    ): bool {
         $pk = (string) $finding->pk;
         if (strpos($pk, Finding::BULK_PREFIX . 'orphan:') === 0) {
             $this->reportStep($finding->table, self::SCENARIO_ORPHAN);
@@ -286,13 +298,11 @@ final class Fixer
             $names = $finding->entityId !== null && $finding->entityId !== ''
                 ? explode('|', (string) $finding->entityId)
                 : [];
-            $locale = $finding->suggestedLocale !== '' ? $finding->suggestedLocale : $this->defaultLocale;
-            $updated = $this->gateway->fixEmptyLocales($finding->table, $names, $locale);
-            if ($updated > 0) {
-                $result['localesFixed'] += $updated;
-            } elseif ($finding->rowCount > 0) {
-                $result['failed']++;
-            }
+            $this->applyLocaleResolution(
+                $localeResolver->resolve($finding->table, $names),
+                $finding->rowCount,
+                $result
+            );
             return true;
         }
         if ($pk === Finding::bulkPk('review')) {

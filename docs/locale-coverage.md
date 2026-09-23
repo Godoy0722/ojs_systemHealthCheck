@@ -18,7 +18,14 @@ Any schema-marked multilingual field with a bad locale tag is in scope, whether 
 
 ## What `--fix` does
 
-Retags existing bad rows: stamps the site's primary locale onto rows where `locale` is empty or `NULL`.
+Resolves each empty/`NULL`-locale row individually (`src/MissingLocaleResolver.php`), re-reading the database before every write so no field ends up with a duplicate locale and no empty locale remains:
+
+1. The row's journal is resolved through the cascade paths in `src/JournalCascadeRegistry.php` (e.g. `author_settings > authors > publications > submissions.context_id`). Its locales are `supportedFormLocales` (fallback `supportedLocales`), primary locale first. Rows with no live journal (`site_settings`, `user_settings`, orphans, …) use the site's `supported_locales`.
+2. The locales already stored for the same field (same unique-key columns except `locale`) are compared with those locales:
+   - some journal locales are still missing → the row is retagged with the primary locale if it is missing, otherwise with the first missing one;
+   - every journal locale is already set → the empty-locale row is a duplicate and is **deleted**.
+
+With a single journal locale this means: retag when that locale is not yet set for the field, delete when it is.
 
 ---
 
@@ -37,7 +44,7 @@ Reads OJS 3.3 JSON schemas (`lib/pkp/schemas/` + `schemas/`) for properties with
 - `site_settings`
 - `submission_file_settings`
 
-**Fix suggestion:** site primary locale (e.g. `en`).
+**Fix:** per-row journal locale resolution (see above).
 
 ---
 
@@ -51,7 +58,7 @@ Examples of heuristic-only tables on a typical OJS 3.3 install:
 - `submission_settings`, `publication_galley_settings`
 - `category_settings`, `genre_settings`, `review_form_settings`, `navigation_menu_item_settings`, `static_page_settings`, and other plugin/legacy settings tables
 
-**Fix suggestion:** site primary locale on `--fix`.
+**Fix:** per-row journal locale resolution on `--fix` (see above).
 
 ---
 
