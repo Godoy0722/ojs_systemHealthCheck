@@ -576,7 +576,11 @@ final class IlluminateDatabaseGateway
         if ($pkCol === null) {
             return;
         }
-        $select = [$pkCol . ' as pk', 'setting_name', 'locale', 'setting_value'];
+        $hasLocale = $this->columnExists($settingsTable, 'locale');
+        $select = [$pkCol . ' as pk', 'setting_name', 'setting_value'];
+        if ($hasLocale) {
+            $select[] = 'locale';
+        }
         if ($fkCol !== null) {
             $select[] = $fkCol . ' as fk';
         }
@@ -586,17 +590,17 @@ final class IlluminateDatabaseGateway
                 ->whereNull('setting_value')
                 ->orderBy($pkCol)
                 ->cursor();
+            foreach ($cursor as $row) {
+                yield [
+                    'pk' => $row->pk,
+                    'fk' => $fkCol === null ? null : ($row->fk ?? null),
+                    'setting_name' => (string) ($row->setting_name ?? ''),
+                    'locale' => $hasLocale ? $row->locale : null,
+                    'setting_value' => $row->setting_value,
+                ];
+            }
         } catch (\Throwable $e) {
             return;
-        }
-        foreach ($cursor as $row) {
-            yield [
-                'pk' => $row->pk,
-                'fk' => $fkCol === null ? null : ($row->fk ?? null),
-                'setting_name' => (string) ($row->setting_name ?? ''),
-                'locale' => $row->locale,
-                'setting_value' => $row->setting_value,
-            ];
         }
     }
 
