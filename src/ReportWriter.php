@@ -604,9 +604,9 @@ final class ReportWriter
                 $where = $parentTable !== null ? ('"' . $parentTable . '"') : 'its parent table';
                 return 'This row references a record in ' . $where . ' that no longer exists. The setting is dangling and should be removed.';
             case Finding::REASON_SCHEMA_MISSING_LOCALE:
-                return 'A multilingual field was stored without a locale tag. PHP 8 cannot hydrate this value and will throw a TypeError.';
+                return 'A multilingual field was stored with a locale OJS cannot use (empty or not an installable locale such as "0"). PHP 8 cannot hydrate this value and will throw a TypeError.';
             case Finding::REASON_HEURISTIC_LOCALE_MISMATCH:
-                return 'This setting name has both localized and non-localized rows in the same table. The empty-locale rows look out of place.';
+                return 'This setting name has both valid-locale rows and rows whose locale is empty or not an installable OJS locale. Those rows look out of place.';
             case Finding::REASON_REQUIRED_NULL:
                 return 'A required field is empty (NULL) in the database. The schema declares it mandatory, so something wrote a broken row here.';
             case Finding::REASON_SETTING_VALUE_NULL:
@@ -719,7 +719,7 @@ final class ReportWriter
         } elseif ($f->settingName !== '') {
             $localeLabel = ($f->locale === null || $f->locale === '')
                 ? 'no locale tag'
-                : 'locale "' . $f->locale . '"';
+                : 'invalid locale "' . $f->locale . '"';
             $lines[] = '      Field   : ' . $f->settingName . '  (' . $localeLabel . ')';
         }
 

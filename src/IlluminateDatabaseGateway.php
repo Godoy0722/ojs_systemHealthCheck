@@ -27,6 +27,15 @@ final class IlluminateDatabaseGateway
     private const ID_CHUNK = 500;
 
     /**
+     * Locale codes OJS itself considers installable: the same format rule as
+     * AppLocale::isLocaleValid() (PKPLocale.inc.php) plus a locale directory on
+     * disk. Cached per process.
+     *
+     * @var string[]|null
+     */
+    private static $validLocales = null;
+
+    /**
      * Tables with an FK to central `files.file_id`. Matches OJS 3.4
      * PreflightCheckMigration::getEntityRelationships():
      *   'files' => ['submission_files', 'submission_file_revisions']
@@ -65,6 +74,35 @@ final class IlluminateDatabaseGateway
             // fall through to config
         }
         return (string) \Config::getVar('database', 'name');
+    }
+
+    /**
+     * Locale codes OJS can install: format xx_XX with an optional @variant,
+     * exactly as AppLocale::isLocaleValid() checks it, and a directory under
+     * the application's locale/ folder. Codes that fail either condition
+     * (e.g. '0', 'en', 'pt-BR') cannot be hydrated by OJS.
+     *
+     * @param string $ojsRoot Application root (dirname of index.php)
+     * @return string[]
+     */
+    public static function validLocales(string $ojsRoot): array
+    {
+        if (self::$validLocales !== null) {
+            return self::$validLocales;
+        }
+        $locales = [];
+        $dir = rtrim($ojsRoot, '/') . '/locale';
+        $entries = is_dir($dir) ? scandir($dir) : [];
+        foreach ($entries as $entry) {
+            if ($entry === '.' || $entry === '..' || !is_dir($dir . '/' . $entry)) {
+                continue;
+            }
+            if (preg_match('/^[a-z][a-z]_[A-Z][A-Z](@([A-Za-z0-9]{5,8}|\d[A-Za-z0-9]{3}))?$/', $entry)) {
+                $locales[] = $entry;
+            }
+        }
+        sort($locales);
+        return self::$validLocales = $locales;
     }
 
     /**
@@ -201,11 +239,14 @@ final class IlluminateDatabaseGateway
     }
 
     /**
-     * Counts rows with empty/NULL locale on the given setting names.
+     * Counts rows whose locale is empty, NULL, or not an installable OJS locale
+     * on the given setting names.
+     *
+     * @param string[] $validLocales
      */
-    public function countEmptyLocaleRows(string $table, array $settingNames): int
+    public function countEmptyLocaleRows(string $table, array $settingNames, array $validLocales): int
     {
-        if (empty($settingNames) || !$this->tableExists($table)) {
+        if (empty($settingNames) || empty($validLocales) || !$this->tableExists($table)) {
             return 0;
         }
         $meta = $this->getTableMeta($table);
@@ -213,12 +254,9 @@ final class IlluminateDatabaseGateway
             return 0;
         }
         try {
-            return (int) Capsule::table($table)
-                ->whereIn('setting_name', $settingNames)
-                ->where(function ($q) {
-                    $q->where('locale', '')->orWhereNull('locale');
-                })
-                ->count();
+            $query = Capsule::table($table)->whereIn('setting_name', $settingNames);
+            $this->applyInvalidLocaleClause($query, $validLocales);
+            return (int) $query->count();
         } catch (\Throwable $e) {
             return 0;
         }
@@ -241,8 +279,9 @@ final class IlluminateDatabaseGateway
                 ->select('setting_name')
                 ->groupBy('setting_name')
                 ->havingRaw(
-                    "SUM(CASE WHEN locale = '' OR locale IS NULL THEN 1 ELSE 0 END) > 0"
-                    . " AND SUM(CASE WHEN locale <> '' AND locale IS NOT NULL THEN 1 ELSE 0 END) > 0"
+                    'SUM(CASE WHEN locale IS NULL OR locale NOT IN (' . self::localePlaceholders() . ') THEN 1 ELSE 0 END) > 0'
+                    . ' AND SUM(CASE WHEN locale IN (' . self::localePlaceholders() . ') THEN 1 ELSE 0 END) > 0',
+                    array_merge(self::validLocales(''), self::validLocales(''))
                 )
                 ->get();
         } catch (\Throwable $e) {
@@ -840,10 +879,8 @@ final class IlluminateDatabaseGateway
         }
         $query = Capsule::table($table)
             ->select(array_merge($groupColumns, ['locale']))
-            ->whereIn('setting_name', $settingNames)
-            ->where(function ($q) {
-                $q->where('locale', '')->orWhereNull('locale');
-            });
+                ->whereIn('setting_name', $settingNames);
+        $this->applyInvalidLocaleClause($query, self::validLocales(''));
         foreach ($filters as $column => $value) {
             $query->where($column, $value);
         }
@@ -872,8 +909,7 @@ final class IlluminateDatabaseGateway
         $query = Capsule::table($table)
             ->select('locale')
             ->distinct()
-            ->where('locale', '<>', '')
-            ->whereNotNull('locale');
+            ->whereIn('locale', self::validLocales(''));
         $this->applyGroupClause($query, $group);
         return array_map(function ($row) {
             return (string) $row->locale;
@@ -881,30 +917,30 @@ final class IlluminateDatabaseGateway
     }
 
     /**
-     * Retags exactly one empty/NULL-locale row of a field group.
+     * Retags exactly one invalid-locale row of a field group.
      *
      * @param array<string, mixed> $group
-     * @param string|null $currentLocale '' or NULL, matched exactly
+     * @param string|null $currentLocale Matched exactly; null matches NULL
      */
     public function retagEmptyLocaleRow(string $table, array $group, ?string $currentLocale, string $newLocale): int
     {
         $query = Capsule::table($table);
         $this->applyGroupClause($query, $group);
-        $this->applyExactEmptyLocale($query, $currentLocale);
+        $this->applyExactLocale($query, $currentLocale);
         return (int) $query->limit(1)->update(['locale' => $newLocale]);
     }
 
     /**
-     * Deletes exactly one empty/NULL-locale row of a field group.
+     * Deletes exactly one invalid-locale row of a field group.
      *
      * @param array<string, mixed> $group
-     * @param string|null $currentLocale '' or NULL, matched exactly
+     * @param string|null $currentLocale Matched exactly; null matches NULL
      */
     public function deleteEmptyLocaleRow(string $table, array $group, ?string $currentLocale): int
     {
         $query = Capsule::table($table);
         $this->applyGroupClause($query, $group);
-        $this->applyExactEmptyLocale($query, $currentLocale);
+        $this->applyExactLocale($query, $currentLocale);
         return (int) $query->limit(1)->delete();
     }
 
@@ -920,11 +956,30 @@ final class IlluminateDatabaseGateway
     }
 
     /**
+     * Rows whose locale is NULL or not an installable OJS locale.
+     *
+     * @param \Illuminate\Database\Query\Builder $query
+     * @param string[] $validLocales
+     */
+    private function applyInvalidLocaleClause($query, array $validLocales): void
+    {
+        $query->where(function ($q) use ($validLocales) {
+            $q->whereNull('locale')->orWhereNotIn('locale', $validLocales);
+        });
+    }
+
+    /** @return string Comma-separated '?' placeholders for the valid locales. */
+    private static function localePlaceholders(): string
+    {
+        return implode(',', array_fill(0, count(self::validLocales('')), '?'));
+    }
+
+    /**
      * @param \Illuminate\Database\Query\Builder $query
      */
-    private function applyExactEmptyLocale($query, ?string $locale): void
+    private function applyExactLocale($query, ?string $locale): void
     {
-        $locale === null ? $query->whereNull('locale') : $query->where('locale', '');
+        $locale === null ? $query->whereNull('locale') : $query->where('locale', $locale);
     }
 
     /**
@@ -1112,14 +1167,11 @@ final class IlluminateDatabaseGateway
             $select[] = $fkCol . ' as fk';
         }
         try {
-            $cursor = Capsule::table($table)
+            $query = Capsule::table($table)
                 ->select($select)
-                ->whereIn('setting_name', $settingNames)
-                ->where(function ($q) {
-                    $q->where('locale', '')->orWhereNull('locale');
-                })
-                ->orderBy($pkCol)
-                ->cursor();
+                ->whereIn('setting_name', $settingNames);
+            $this->applyInvalidLocaleClause($query, self::validLocales(''));
+            $cursor = $query->orderBy($pkCol)->cursor();
         } catch (\Throwable $e) {
             return;
         }

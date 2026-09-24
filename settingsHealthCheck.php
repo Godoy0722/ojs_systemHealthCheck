@@ -370,7 +370,7 @@ class SettingsHealthCheckTool extends CommandLineTool
                 'DELETE',
                 [
                     'Scenario: Bad locale tags (' . $locale . ' row(s)).',
-                    'Multilingual settings were stored with an empty locale tag, which PHP 8 cannot hydrate.',
+                    'Multilingual settings were stored with an empty or invalid locale tag, which PHP 8 cannot hydrate.',
                     'Each row is checked against the locales of its journal (site locales when it has no journal):',
                     'it is UPDATED to a journal locale not yet set for that field (primary locale first),',
                     'or DELETED when every journal locale is already set for that field.',

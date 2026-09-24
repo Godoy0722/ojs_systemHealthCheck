@@ -185,7 +185,7 @@ final class Scanner
             $status = 'clean';
             $note = '';
             try {
-                $count = $this->gateway->countEmptyLocaleRows($table, $names);
+                $count = $this->gateway->countEmptyLocaleRows($table, $names, $this->gateway->validLocales(dirname(INDEX_FILE_LOCATION)));
                 if ($count > 0) {
                     $this->findings[] = new Finding(
                         $table,
@@ -230,7 +230,7 @@ final class Scanner
             try {
                 $suspects = $this->gateway->findSuspectSettingNames($table);
                 if (!empty($suspects)) {
-                    $count = $this->gateway->countEmptyLocaleRows($table, $suspects);
+                    $count = $this->gateway->countEmptyLocaleRows($table, $suspects, $this->gateway->validLocales(dirname(INDEX_FILE_LOCATION)));
                     if ($count > 0) {
                         $this->findings[] = new Finding(
                             $table,

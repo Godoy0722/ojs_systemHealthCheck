@@ -47,7 +47,7 @@ Add `-f` or `--fix` to apply remediations:
 
 The tool scans every `*_settings` table in the database across 5 passes, looking for data that can break the application or block maintenance operations:
 
-1. **Bad locale tags** — `*_settings` rows where a multilingual field was saved with an empty or `NULL` locale code. These cause `TypeError` crashes in PHP 8. See [locale coverage](docs/locale-coverage.md).
+1. **Bad locale tags** — `*_settings` rows where a multilingual field was saved with an empty, `NULL`, or otherwise invalid locale code (anything OJS cannot install, such as `0`). These cause `TypeError` crashes in PHP 8. See [locale coverage](docs/locale-coverage.md).
 
 2. **Orphaned settings, entities & files** — Settings rows whose parent entity was deleted; invalid entity FK columns inside live journals (e.g. `submission_files.submission_id` pointing to a missing submission); invalid stored values (e.g. `publication_settings.issueId`); and unreferenced rows in the central `files` blob table.
 
