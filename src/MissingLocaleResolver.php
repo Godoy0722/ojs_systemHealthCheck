@@ -50,6 +50,9 @@ final class MissingLocaleResolver
     /** @var string[] */
     private array $warnings = [];
 
+    /** @var array<int, array{table:string,settingName:string,oldLocale:?string,newLocale:string,journalId:?int,group:array<string,mixed>,value:?string}> */
+    private array $preservedLocales = [];
+
     public function __construct(IlluminateDatabaseGateway $gateway, ?JournalCascadeRegistry $cascadeRegistry = null)
     {
         $this->gateway = $gateway;
@@ -118,13 +121,16 @@ final class MissingLocaleResolver
     }
 
     /**
-     * @param array{group: array<string, mixed>, locale: ?string} $row
+     * @param array{group: array<string, mixed>, locale: ?string, value?: ?string} $row
      * @param array<string, mixed>|null $step
      * @return string|null 'retagged', 'deleted', or null when nothing changed
      */
     private function resolveRow(string $table, array $row, ?array $step, ?string $parentColumn): ?string
     {
-        $locales = $this->localesForRow($table, $row['group'], $step, $parentColumn);
+        $journalId = $step !== null && $parentColumn !== null
+            ? $this->resolveJournalId($table, $step, $row['group'][$parentColumn])
+            : null;
+        $locales = $this->localesForRow($journalId);
         $tagged = $this->gateway->getTaggedLocales($table, $row['group']);
         $missing = array_values(array_diff($locales, $tagged));
 
@@ -133,22 +139,24 @@ final class MissingLocaleResolver
                 ? 'deleted'
                 : null;
         }
-        return $this->gateway->retagEmptyLocaleRow($table, $row['group'], $row['locale'], $missing[0]) > 0
-            ? 'retagged'
-            : null;
+        if ($this->gateway->retagEmptyLocaleRow($table, $row['group'], $row['locale'], $missing[0]) === 0) {
+            return null;
+        }
+        $this->preservedLocales[] = [
+            'table' => $table,
+            'settingName' => (string) ($row['group']['setting_name'] ?? ''),
+            'oldLocale' => $row['locale'],
+            'newLocale' => $missing[0],
+            'journalId' => $journalId,
+            'group' => $row['group'],
+            'value' => $row['value'] ?? null,
+        ];
+        return 'retagged';
     }
 
-    /**
-     * @param array<string, mixed> $group
-     * @param array<string, mixed>|null $step
-     * @return string[] Primary locale first
-     */
-    private function localesForRow(string $table, array $group, ?array $step, ?string $parentColumn): array
+    /** @return string[] Primary locale first */
+    private function localesForRow(?int $journalId): array
     {
-        $journalId = null;
-        if ($step !== null && $parentColumn !== null) {
-            $journalId = $this->resolveJournalId($table, $step, $group[$parentColumn]);
-        }
         $journalLocales = $this->getJournalLocales();
         if ($journalId !== null && !empty($journalLocales[$journalId])) {
             return $journalLocales[$journalId];
@@ -229,5 +237,16 @@ final class MissingLocaleResolver
     public function getWarnings(): array
     {
         return $this->warnings;
+    }
+
+    /**
+     * Rows whose invalid locale tag was replaced by a real locale. The value
+     * survives the fix, so it becomes visible wherever that locale is rendered.
+     *
+     * @return array<int, array{table:string,settingName:string,oldLocale:?string,newLocale:string,journalId:?int,group:array<string,mixed>,value:?string}>
+     */
+    public function getPreservedLocales(): array
+    {
+        return $this->preservedLocales;
     }
 }

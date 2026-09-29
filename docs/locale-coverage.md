@@ -27,6 +27,10 @@ Resolves each invalid-locale row individually (`src/MissingLocaleResolver.php`),
 
 With a single journal locale this means: retag when that locale is not yet set for the field, delete when it is.
 
+### Preserved-locale report
+
+Retagging keeps the old value instead of deleting it, and the locale it moves to had no value for that field before. The value therefore starts rendering on the front end whenever that locale is the one being displayed. Every retag is recorded and, once the fix passes finish, the tool prints a **Preserved invalid-locale values** report listing the table, row, field, old and new locale, journal, and value preview. The same report is always written to a `settingsHealthCheck_locale_preserved_<timestamp>.txt` file, in the same location and with the same `0600` permissions as the scenario exports saved from the menu.
+
 ---
 
 ## Pass A — schema-driven (high severity)

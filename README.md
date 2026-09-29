@@ -126,6 +126,10 @@ Press `s` at the post-detail prompt to save the current scenario as a plain-text
 
 You can export multiple scenarios in one session.
 
+### Preserved-locale report (`--locale --fix`)
+
+When the locale fix retags a row instead of deleting it, the old value is preserved under a real locale that previously had no value for that field, so it starts showing on the front end when that locale is displayed. After the fix passes finish, the tool prints every such row and automatically writes the same report to `settingsHealthCheck_locale_preserved_<timestamp>.txt`, in the same directory and with the same `0600` permissions as the exports above. See [docs/locale-coverage.md](docs/locale-coverage.md) for details.
+
 ## Example: Interactive Session
 
 ```bash

@@ -155,6 +155,7 @@ class SettingsHealthCheckTool extends CommandLineTool
                 $findings = $allFindings;
                 $pass = 0;
                 $lastPassResult = null;
+                $preservedLocales = [];
 
                 while ($pass < self::MAX_FIX_PASSES) {
                     $fixableBefore = $this->countFixableRows($findings);
@@ -178,6 +179,9 @@ class SettingsHealthCheckTool extends CommandLineTool
                     $fixProgress->finish('Fix pass complete.');
                     $lastPassResult = $fixResult;
                     $this->mergeFixSuccessTotals($totals, $fixResult);
+                    foreach ($fixer->getPreservedLocales() as $preserved) {
+                        $preservedLocales[] = $preserved;
+                    }
                     foreach ($fixer->getWarnings() as $w) {
                         fwrite(STDERR, ReportWriter::color("[WARN]", 'bold|yellow', STDERR) . " {$w}\n");
                     }
@@ -225,6 +229,7 @@ class SettingsHealthCheckTool extends CommandLineTool
                 $stats = $writer->computeStats($findings);
                 $remainingFixable = $this->countFixableRows($findings);
                 echo $this->renderFixSummary($totals, $pass, $remainingFixable, $lastPassResult, $findings);
+                $this->reportPreservedLocales($writer, $preservedLocales);
                 $exitCode = $remainingFixable > 0 ? 1 : 0;
             } else {
                 $exitCode = $stats > 0 ? 1 : 0;
@@ -374,6 +379,8 @@ class SettingsHealthCheckTool extends CommandLineTool
                     'Each row is checked against the locales of its journal (site locales when it has no journal):',
                     'it is UPDATED to a journal locale not yet set for that field (primary locale first),',
                     'or DELETED when every journal locale is already set for that field.',
+                    'Retagged values stay in the database and will render under their new locale;',
+                    'they are listed on screen and in a preserved-locale report file after the fix.',
                 ],
             ],
             [$entityNullify, 'UPDATE', $nullifyLines],
@@ -496,6 +503,28 @@ class SettingsHealthCheckTool extends CommandLineTool
             $lines[] = '  ' . $c('All fixable records resolved.', 'green');
         }
         return implode("\n", $lines) . "\n";
+    }
+
+    /**
+     * Prints the preserved-locale report and always writes it to a file, so the
+     * operator has a record of values that are now visible under a real locale.
+     *
+     * @param array<int, array<string, mixed>> $preservedLocales
+     */
+    private function reportPreservedLocales(ReportWriter $writer, array $preservedLocales): void
+    {
+        if (empty($preservedLocales)) {
+            return;
+        }
+        $writer->renderLocalePreservation($preservedLocales);
+
+        $path = $writer->saveLocalePreservationReport($preservedLocales);
+        if ($path === null) {
+            fwrite(STDERR, ReportWriter::color('[WARN]', 'bold|yellow', STDERR)
+                . " Could not write the preserved-locale report to a file.\n");
+            return;
+        }
+        echo '  ' . ReportWriter::color('Preserved-locale report saved: ', 'green') . $path . "\n\n";
     }
 
     /** @param string[] $warningLines */

@@ -35,6 +35,9 @@ final class Fixer
     /** @var string[] */
     private array $warnings = [];
 
+    /** @var array<int, array<string, mixed>> */
+    private array $preservedLocales = [];
+
     public function __construct(IlluminateDatabaseGateway $gateway, ?JournalCascadeRegistry $cascadeRegistry = null)
     {
         $this->gateway = $gateway;
@@ -233,6 +236,9 @@ final class Fixer
 
         foreach (array_merge($entityCleaner->getWarnings(), $localeResolver->getWarnings()) as $w) {
             $this->warnings[] = $w;
+        }
+        foreach ($localeResolver->getPreservedLocales() as $preserved) {
+            $this->preservedLocales[] = $preserved;
         }
 
         return $result;
@@ -463,5 +469,16 @@ final class Fixer
     public function getWarnings(): array
     {
         return $this->warnings;
+    }
+
+    /**
+     * Locale retags applied during this pass. Each entry is a value that was
+     * kept alive under a real locale instead of being deleted.
+     *
+     * @return array<int, array<string, mixed>>
+     */
+    public function getPreservedLocales(): array
+    {
+        return $this->preservedLocales;
     }
 }

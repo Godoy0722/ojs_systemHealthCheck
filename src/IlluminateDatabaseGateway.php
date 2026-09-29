@@ -864,7 +864,7 @@ final class IlluminateDatabaseGateway
      * @param string[] $groupColumns From getLocaleGroupColumns()
      * @param string[] $settingNames
      * @param array<string, mixed> $filters Extra column => value equality filters
-     * @return array<int, array{group: array<string, mixed>, locale: ?string}>
+     * @return array<int, array{group: array<string, mixed>, locale: ?string, value: ?string}>
      */
     public function findEmptyLocaleRowsPage(
         string $table,
@@ -877,8 +877,13 @@ final class IlluminateDatabaseGateway
         if (empty($settingNames) || empty($groupColumns) || !$this->tableExists($table)) {
             return [];
         }
+        $hasValue = $this->columnExists($table, 'setting_value');
+        $selected = array_merge($groupColumns, ['locale']);
+        if ($hasValue) {
+            $selected[] = 'setting_value';
+        }
         $query = Capsule::table($table)
-            ->select(array_merge($groupColumns, ['locale']))
+            ->select($selected)
                 ->whereIn('setting_name', $settingNames);
         $this->applyInvalidLocaleClause($query, self::validLocales(''));
         foreach ($filters as $column => $value) {
@@ -893,7 +898,11 @@ final class IlluminateDatabaseGateway
             foreach ($groupColumns as $column) {
                 $group[$column] = $row->{$column} ?? null;
             }
-            $rows[] = ['group' => $group, 'locale' => $row->locale ?? null];
+            $rows[] = [
+                'group' => $group,
+                'locale' => $row->locale ?? null,
+                'value' => $hasValue && $row->setting_value !== null ? (string) $row->setting_value : null,
+            ];
         }
         return $rows;
     }

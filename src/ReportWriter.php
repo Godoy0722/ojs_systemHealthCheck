@@ -512,6 +512,113 @@ final class ReportWriter
         return $path;
     }
 
+    /**
+     * Plain-text body of the preserved-locale report, shared by the stdout
+     * render and the exported file so both stay identical.
+     *
+     * @param array<int, array<string, mixed>> $records
+     * @return string[]
+     */
+    private function localePreservationLines(array $records): array
+    {
+        $sep = str_repeat('─', 66);
+        $total = count($records);
+
+        $lines = [];
+        $lines[] = $sep;
+        $lines[] = 'Preserved invalid-locale values';
+        $lines[] = $total . ' row' . ($total === 1 ? '' : 's') . ' retagged instead of deleted';
+        $lines[] = $sep;
+        $lines[] = '';
+        $lines[] = 'The locale tag on these rows was invalid, so the value could not be';
+        $lines[] = 'displayed. Rather than dropping it, the fix moved each value to a locale';
+        $lines[] = 'of its journal (site locales when the row has no journal) that had no';
+        $lines[] = 'value for that field yet. Those locales were previously empty, so the';
+        $lines[] = 'old content will now render on the front end whenever that locale is the';
+        $lines[] = 'one being displayed. Review the values below and correct or remove any';
+        $lines[] = 'that should not be published under the new locale.';
+        $lines[] = '';
+
+        $byTable = [];
+        foreach ($records as $record) {
+            $byTable[(string) $record['table']][] = $record;
+        }
+        ksort($byTable);
+
+        foreach ($byTable as $table => $rows) {
+            $count = count($rows);
+            $lines[] = '▸ ' . $table . '  (' . $count . ' row' . ($count === 1 ? ')' : 's)');
+            $lines[] = '';
+            foreach ($rows as $record) {
+                $old = $record['oldLocale'];
+                $oldLabel = $old === null ? 'NULL' : ($old === '' ? '(empty)' : '"' . $old . '"');
+                $lines[] = '    ' . $this->describeLocaleGroup((array) $record['group']);
+                $lines[] = '      Field   : ' . (string) $record['settingName'];
+                $lines[] = '      Moved   : locale ' . $oldLabel . ' → "' . (string) $record['newLocale'] . '"';
+                $lines[] = '      Journal : ' . ($record['journalId'] === null
+                    ? '(none — site locales used)'
+                    : '#' . (string) $record['journalId']);
+                if ($record['value'] !== null && $record['value'] !== '') {
+                    $lines[] = '      Value   : ' . $this->truncate((string) $record['value'], 100);
+                }
+                $lines[] = '      Effect  : "' . (string) $record['newLocale']
+                    . '" had no value for this field before; it now shows this content.';
+                $lines[] = '';
+            }
+        }
+
+        return $lines;
+    }
+
+    /** @param array<string, mixed> $group */
+    private function describeLocaleGroup(array $group): string
+    {
+        $parts = [];
+        foreach ($group as $column => $value) {
+            if ($column === 'setting_name') {
+                continue;
+            }
+            $parts[] = $column . ' = ' . ($value === null ? 'NULL' : (string) $value);
+        }
+        return empty($parts) ? 'Row' : implode(', ', $parts);
+    }
+
+    /**
+     * Prints the preserved-locale report to stdout.
+     *
+     * @param array<int, array<string, mixed>> $records
+     */
+    public function renderLocalePreservation(array $records): void
+    {
+        if (empty($records)) {
+            return;
+        }
+        echo "\n";
+        foreach ($this->localePreservationLines($records) as $line) {
+            echo $line === '' ? "\n" : '  ' . $line . "\n";
+        }
+    }
+
+    /**
+     * Writes the preserved-locale report next to the scenario exports.
+     *
+     * @param array<int, array<string, mixed>> $records
+     * @return string|null Path written, or null on failure/no records
+     */
+    public function saveLocalePreservationReport(array $records): ?string
+    {
+        if (empty($records)) {
+            return null;
+        }
+        $filename = 'settingsHealthCheck_locale_preserved_' . date('Ymd_His') . '.txt';
+        $path = $this->exportDirectory() . '/' . $filename;
+        if (file_put_contents($path, implode("\n", $this->localePreservationLines($records))) === false) {
+            return null;
+        }
+        @chmod($path, 0600);
+        return $path;
+    }
+
     private function exportDirectory(): string
     {
         $ojsRoot = defined('INDEX_FILE_LOCATION')
